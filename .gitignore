@@ -1,0 +1,26 @@
+# Build/runtime outputs
+DolphinNetPlayLauncher.exe
+DolphinNetPlayLauncher.pdb
+SDL3.dll
+SDL3-LICENSE.txt
+Release/
+*.zip
+
+# Local launcher state / diagnostics
+config.ini
+DolphinNetPlayLauncher-Diagnostics.log
+*.log
+
+# IDE / compiler artifacts
+.vs/
+bin/
+obj/
+*.user
+*.suo
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.tmp
+*.bak

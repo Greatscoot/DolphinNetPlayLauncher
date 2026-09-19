@@ -1,0 +1,30 @@
+Dolphin NetPlay Launcher — Custom Sound Themes
+
+Create a folder inside the launcher Sounds folder. The folder name becomes the
+sound-theme name shown in Options -> Appearance.
+
+Example:
+Sounds\My Theme\
+
+Every sound theme must contain these 11 WAV files:
+  navigate.wav
+  switch.wav
+  library_open.wav
+  library_close.wav
+  stage_game.wav
+  use_game.wav
+  launch.wav
+  confirm.wav
+  cancel.wav
+  clear_game.wav
+  error.wav
+
+Dolphin NetPlay Launcher accepts uncompressed PCM WAV files in 8-bit or 16-bit, mono or stereo,
+from 8 kHz through 192 kHz. They are converted in memory to the shared
+low-latency 44.1 kHz mono playback pool.
+
+Use Options -> Appearance -> Validate Folder... to see exactly which files are
+missing or unreadable. After adding/removing a valid folder, open the Sound style
+dropdown or press Refresh.
+
+Only distribute sounds you have the right to share.

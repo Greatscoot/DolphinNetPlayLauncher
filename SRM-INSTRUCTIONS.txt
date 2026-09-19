@@ -1,0 +1,37 @@
+DOLPHIN NETPLAY LAUNCHER - STEAM ROM MANAGER QUICK SETUP
+=========================================================
+
+For screenshots and the complete walkthrough, open:
+Documentation\Dolphin-NetPlay-Launcher-SRM-Setup-Guide-v6.pdf
+
+QUICK SETUP
+-----------
+1. Clone your existing working Dolphin parser in Steam ROM Manager.
+2. Set STEAM COLLECTIONS to something separate, such as:
+       Dolphin Netplay
+3. If you want GameCube + Wii in one parser, set ROMS DIRECTORY to the parent
+   folder containing both platform folders and make the Search Glob match both.
+4. Set EXECUTABLE to:
+       DolphinNetPlayLauncher.exe
+5. Set COMMAND LINE ARGUMENTS to exactly:
+       "${filePath}"
+   Do NOT include Dolphin's normal -e argument.
+6. Set the Title Modifier to:
+       ${fuzzyTitle} Netplay
+7. Save and parse. Exclude games you do not want in the NetPlay collection,
+   then save the app list to Steam.
+
+USING THE STEAM ENTRIES
+-----------------------
+HOST:
+  Choose a Netplay game in Steam -> Play -> Host -> Host
+
+JOIN:
+  A local selected game is NOT required. The host determines the game.
+  Choose Join, then use Sessions, a Traversal room code, or Direct IP.
+
+NOTES
+-----
+- Dolphin itself performs emulation and NetPlay.
+- Players still need compatible Dolphin builds and matching game data as required by Dolphin.
+- Dolphin NetPlay Launcher does not provide Dolphin or game files.

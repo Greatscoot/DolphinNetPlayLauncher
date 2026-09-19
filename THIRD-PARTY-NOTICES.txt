@@ -1,0 +1,26 @@
+DOLPHIN NETPLAY LAUNCHER - THIRD-PARTY NOTICES
+==============================================
+
+Dolphin Emulator
+----------------
+Dolphin NetPlay Launcher is an unofficial frontend that works with a user's
+existing Dolphin installation. Dolphin is not bundled with this project and
+Dolphin NetPlay Launcher is not affiliated with or endorsed by the Dolphin
+Emulator project.
+
+SDL3
+----
+Controller input uses SDL3. Build.bat downloads the official Windows x64 SDL3
+runtime when SDL3.dll is not already present and preserves SDL's accompanying
+license as SDL3-LICENSE.txt when available.
+
+Outfit Font
+-----------
+The included Outfit font files are distributed under the SIL Open Font License.
+See Fonts\OFL-Outfit.txt and Fonts\README-FONTS.txt.
+
+OpenAI ChatGPT
+--------------
+OpenAI's ChatGPT was used to generate the application's code from the project
+creator's requirements, feedback, testing, and design decisions. ChatGPT is a
+development tool used by the project; OpenAI does not endorse this project.

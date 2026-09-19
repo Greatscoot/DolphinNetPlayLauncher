@@ -6,6 +6,8 @@ Dolphin NetPlay Launcher is a Windows frontend for **Dolphin NetPlay**. It simpl
 
 > **Unofficial project:** not affiliated with or endorsed by the Dolphin Emulator project. Dolphin NetPlay Launcher does not include Dolphin or game files.
 
+> **AI-assisted development:** Dolphin NetPlay Launcher was developed with OpenAI's ChatGPT generating the application's code from my requirements, feedback, testing, and design decisions.
+
 ## What it does
 
 - Makes **Host** and **Join** setup controller-friendly.

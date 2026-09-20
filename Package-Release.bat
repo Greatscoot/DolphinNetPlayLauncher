@@ -74,7 +74,7 @@ for %%T in (Adventure Royal ClassicUI) do (
 )
 
 set "ROOT=Release"
-set "PKG=%ROOT%\DolphinNetPlayLauncher-%APP_VERSION%"
+set "PKG=%ROOT%\DolphinNetPlayLauncher"
 set "ZIP=%ROOT%\DolphinNetPlayLauncher-%APP_VERSION%-Windows-x64.zip"
 
 if exist "%PKG%" rmdir /s /q "%PKG%"
@@ -138,7 +138,7 @@ for %%T in (Adventure Royal ClassicUI) do (
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop'; Compress-Archive -Path '%PKG%\*' -DestinationPath '%ZIP%' -Force"
+  "$ErrorActionPreference='Stop'; Compress-Archive -Path '%PKG%' -DestinationPath '%ZIP%' -Force"
 if errorlevel 1 (
   echo ERROR: Could not create release ZIP.
   pause

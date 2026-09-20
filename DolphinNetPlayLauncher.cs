@@ -9,6 +9,7 @@ using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -147,7 +148,7 @@ namespace DolphinNetPlayLauncher
     {
         // Single source of truth for the launcher's visible version.
         // Change this ONE value for each release/build revision.
-        internal const string AppVersion = "0.11.0";
+        internal const string AppVersion = "0.12.0";
         internal const string AppName = "Dolphin NetPlay Launcher";
         internal static string AppDisplayName { get { return AppName + " " + AppVersion; } }
 
@@ -472,6 +473,12 @@ namespace DolphinNetPlayLauncher
             };
             form.OptionsRequested += delegate
             {
+                // Options and Friend Group setup are neutral navigation actions.
+                // They open through synchronous ShowDialog(), so keep the opener cue owned
+                // here (before the modal begins) and suppress the invoking buttons in the
+                // generic post-action paths. Use the same Navigate cue as Refresh.
+                UiSoundManager.PlayNamed(settings, "navigate");
+
                 // RC39: Options mutates the shared settings object when OK is clicked.
                 // Snapshot appearance/font-affecting values before opening the dialog so
                 // controller-only changes (notably polling rate) do not trigger a full
@@ -482,7 +489,7 @@ namespace DolphinNetPlayLauncher
                 bool previousAnimatedThemeBackground = settings.AnimatedThemeBackground;
                 string previousAccentStyle = settings.AccentStyle;
 
-                using (OptionsForm options = new OptionsForm(settings, paths, romPath, version, track, controllerManager))
+                using (OptionsForm options = new OptionsForm(settings, paths, romPath, version, track, controllerManager, form.ConsumeFriendOptionsRequest()))
                 {
                     // The launcher itself is TopMost so it stays visible over Steam.
                     // A normal modal child can briefly appear and then fall behind a
@@ -526,6 +533,7 @@ namespace DolphinNetPlayLauncher
                             settings.ShowControllerPrompts,
                             settings.ControllerPromptStyle,
                             settings.ControllerGamesButton);
+                        form.ApplyFriendGroupSettingsFromOptions();
 
                         bool appearanceVisualsChanged =
                             !string.Equals(previousThemeStyle, settings.ThemeStyle, StringComparison.OrdinalIgnoreCase) ||
@@ -3107,8 +3115,28 @@ namespace DolphinNetPlayLauncher
 
         internal static Image TryLoadBannerFromGameListCache(DolphinPaths paths, string romPath)
         {
+            return TryLoadBannerFromGameListCacheInternal(paths, romPath, "");
+        }
+
+        // NetPlay banner discovery must not depend on the Games panel having
+        // already loaded the launcher's ROM-path cache. Dolphin's gamelist.cache already
+        // contains both the Game ID and the native/custom banner, so Sessions/Friends can
+        // resolve artwork directly by the advertised Game ID on their background worker.
+        internal static Image TryLoadBannerFromGameListCacheByGameId(DolphinPaths paths, string gameId)
+        {
+            return TryLoadBannerFromGameListCacheInternal(paths, "", gameId);
+        }
+
+        private static Image TryLoadBannerFromGameListCacheInternal(
+            DolphinPaths paths, string romPath, string gameId)
+        {
             if (paths == null || string.IsNullOrWhiteSpace(paths.GameListCache) ||
-                !File.Exists(paths.GameListCache) || string.IsNullOrWhiteSpace(romPath))
+                !File.Exists(paths.GameListCache))
+                return null;
+
+            string wantedPath = NormalizeCachePath(romPath);
+            string wantedGameId = (gameId ?? "").Trim();
+            if (wantedPath.Length == 0 && wantedGameId.Length == 0)
                 return null;
 
             try
@@ -3123,7 +3151,7 @@ namespace DolphinNetPlayLauncher
                     // followed by a u32 element count.
                     //
                     // Current Dolphin cache revision is 27. If Dolphin changes the
-                    // layout/revision, simply fail back to the text-only header.
+                    // layout/revision, simply fail back to text/manual artwork.
                     if (fs.Length < 20)
                         return null;
 
@@ -3137,14 +3165,12 @@ namespace DolphinNetPlayLauncher
                     if (entryCount > 100000)
                         return null;
 
-                    string wanted = NormalizeCachePath(romPath);
-
                     for (uint entry = 0; entry < entryCount; entry++)
                     {
                         br.ReadByte(); // m_valid
 
                         string filePath = ReadCacheString(br);
-                        string fileName = ReadCacheString(br);
+                        ReadCacheString(br); // m_file_name
 
                         br.ReadUInt64(); // m_file_size
                         br.ReadUInt64(); // m_volume_size
@@ -3156,7 +3182,7 @@ namespace DolphinNetPlayLauncher
                             SkipLanguageStringMap(br);
 
                         ReadCacheString(br); // m_internal_name
-                        ReadCacheString(br); // m_game_id
+                        string cacheGameId = ReadCacheString(br);
                         ReadCacheString(br); // m_gametdb_id
                         br.ReadUInt64();      // m_title_id
                         ReadCacheString(br); // m_maker_id
@@ -3174,23 +3200,27 @@ namespace DolphinNetPlayLauncher
                         ReadCacheString(br); // m_custom_description
                         ReadCacheString(br); // m_custom_maker
 
-                        CachedBanner volume = ReadCachedBanner(br);
-                        CachedBanner custom = ReadCachedBanner(br);
-
-                        bool isWanted = string.Equals(
-                            NormalizeCachePath(filePath), wanted,
-                            StringComparison.OrdinalIgnoreCase);
+                        bool isWanted =
+                            (wantedPath.Length > 0 && string.Equals(
+                                NormalizeCachePath(filePath), wantedPath, StringComparison.OrdinalIgnoreCase)) ||
+                            (wantedGameId.Length > 0 && string.Equals(
+                                cacheGameId, wantedGameId, StringComparison.OrdinalIgnoreCase));
 
                         if (isWanted)
                         {
+                            CachedBanner volume = ReadCachedBanner(br);
+                            CachedBanner custom = ReadCachedBanner(br);
                             CachedBanner chosen =
                                 custom.Pixels != null && custom.Pixels.Length > 0 ? custom : volume;
                             return CachedBannerToBitmap(chosen);
                         }
 
-                        // Two GameCover objects follow the two banners. Each cover is
-                        // just a serialized vector<u8>; skip them so we land exactly at
-                        // the next GameFile entry.
+                        // Do not allocate/decode every unrelated banner just to find one
+                        // NetPlay game. Skip the two GameBanner payloads cheaply.
+                        SkipCachedBanner(br); // m_volume_banner
+                        SkipCachedBanner(br); // m_custom_banner
+
+                        // Two GameCover objects follow the banners. Each is a vector<u8>.
                         SkipByteVector(br); // m_default_cover
                         SkipByteVector(br); // m_custom_cover
                     }
@@ -3198,8 +3228,8 @@ namespace DolphinNetPlayLauncher
             }
             catch
             {
-                // gamelist.cache is intentionally treated as optional. A malformed,
-                // stale, locked, or future-format cache must never affect NetPlay.
+                // gamelist.cache is optional. A malformed, stale, locked, or future-format
+                // cache must never affect NetPlay functionality.
             }
 
             return null;
@@ -3290,6 +3320,21 @@ namespace DolphinNetPlayLauncher
                 Width = br.ReadUInt32(),
                 Height = br.ReadUInt32()
             };
+        }
+
+        private static void SkipCachedBanner(BinaryReader br)
+        {
+            uint count = br.ReadUInt32();
+            if (count > 4 * 1024 * 1024)
+                throw new InvalidDataException("Unreasonable banner size in Dolphin cache.");
+
+            long bytes = (long)count * sizeof(uint);
+            if (br.BaseStream.Position + bytes + 8 > br.BaseStream.Length)
+                throw new EndOfStreamException();
+
+            br.BaseStream.Seek(bytes, SeekOrigin.Current);
+            br.ReadUInt32(); // width
+            br.ReadUInt32(); // height
         }
 
         private static void SkipByteVector(BinaryReader br)
@@ -4110,9 +4155,9 @@ namespace DolphinNetPlayLauncher
                     else if (key.Equals("AutomationIntroSeen", StringComparison.OrdinalIgnoreCase))
                         settings.AutomationIntroSeen = ParseBool(value, false);
                     else if (key.Equals("AutoReturnAfterFailedJoin", StringComparison.OrdinalIgnoreCase))
-                        settings.AutoReturnAfterFailedJoin = ParseBool(value, false);
+                        settings.AutoReturnAfterFailedJoin = ParseBool(value, true);
                     else if (key.Equals("ReturnToLauncherAfterDolphinClose", StringComparison.OrdinalIgnoreCase))
-                        settings.ReturnToLauncherAfterDolphinClose = ParseBool(value, false);
+                        settings.ReturnToLauncherAfterDolphinClose = ParseBool(value, true);
                     else if (key.Equals("RememberLastMode", StringComparison.OrdinalIgnoreCase))
                         settings.RememberLastMode = ParseBool(value, false);
                     else if (key.Equals("LastMode", StringComparison.OrdinalIgnoreCase))
@@ -4194,6 +4239,32 @@ namespace DolphinNetPlayLauncher
                         settings.InterfaceSounds = ParseBool(value, false);
                     else if (key.Equals("SoundStyle", StringComparison.OrdinalIgnoreCase))
                         settings.SoundStyle = UiSoundManager.NormalizeStyleName(value);
+                    else if (key.Equals("FriendGroupEnabled", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendGroupEnabled = ParseBool(value, false);
+                    else if (key.Equals("FriendGroupName", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendGroupName = RemoveUnsafeIniCharacters(value);
+                    else if (key.Equals("FriendMySessionName", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendMySessionName = RemoveUnsafeIniCharacters(value);
+                    else if (key.Equals("FriendNamesB64", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendNames = DecodeSettingsText(value);
+                    else if (key.Equals("FriendGroupPasswordProtected", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendGroupPassword = UnprotectLocalSecret(value);
+                    else if (key.Equals("FriendRegion", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendRegion = NormalizeFriendRegion(value);
+                    else if (key.Equals("FriendAutoHost", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendAutoHost = ParseBool(value, true);
+                    else if (key.Equals("FriendGroupsProtected", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendGroupsData = UnprotectLocalSecret(value);
+                    else if (key.Equals("FriendActiveGroupId", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendActiveGroupId = RemoveUnsafeIniCharacters(value);
+                    else if (key.Equals("FriendShowOffline", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendShowOffline = ParseBool(value, false);
+                    else if (key.Equals("FriendShowBadges", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendShowBadges = ParseBool(value, true);
+                    else if (key.Equals("NetPlayGameDisplay", StringComparison.OrdinalIgnoreCase))
+                        settings.NetPlayGameDisplay = value.Equals("Banners", StringComparison.OrdinalIgnoreCase) ? "Banners" : "Plain";
+                    else if (key.Equals("FriendLanOverridesB64", StringComparison.OrdinalIgnoreCase))
+                        settings.FriendLanOverrides = DecodeSettingsText(value);
                     else if (key.Equals("FirstRunComplete", StringComparison.OrdinalIgnoreCase))
                     {
                         settings.FirstRunComplete = ParseBool(value, false);
@@ -4255,10 +4326,16 @@ namespace DolphinNetPlayLauncher
                 settings.LibrarySetupAcknowledged = false;
             }
 
+            // Migrate the legacy single-group layout into a local collection once,
+            // then project the selected group back into the legacy active-group fields.
+            FriendGroupCollectionCodec.EnsureCollectionAndActiveProjection(settings);
+            // Offline placeholder rows are not shown in the main workflow.
+            settings.FriendShowOffline = false;
+
             return settings;
         }
 
-        private static void SaveDnlSettings(DnlSettings settings)
+        internal static void SaveDnlSettings(DnlSettings settings)
         {
             SaveDnlSettingsToFile(settings, ConfigFile, true, true);
         }
@@ -4276,6 +4353,9 @@ namespace DolphinNetPlayLauncher
 
             try
             {
+                if (includeConnectionHistory)
+                    FriendGroupCollectionCodec.CaptureActiveProjection(settings);
+
                 string dir = Path.GetDirectoryName(filePath);
                 if (!string.IsNullOrWhiteSpace(dir))
                     Directory.CreateDirectory(dir);
@@ -4322,6 +4402,36 @@ namespace DolphinNetPlayLauncher
                     ? "AnimatedGradient" : "SystemAccent"));
                 lines.Add("InterfaceSounds=" + settings.InterfaceSounds.ToString());
                 lines.Add("SoundStyle=" + UiSoundManager.NormalizeStyleName(settings.SoundStyle));
+                // Friend-group identity/secret fields are local social data, not portable
+                // appearance/behavior preferences. Normal config saves keep them locally;
+                // exported settings deliberately reset/omit them so sharing an exported INI
+                // does not disclose friend aliases, group labels, region, or the group secret.
+                lines.Add("FriendGroupEnabled=" + (includeConnectionHistory ? settings.FriendGroupEnabled.ToString() : "False"));
+                lines.Add("FriendGroupName=" + (includeConnectionHistory
+                    ? RemoveUnsafeIniCharacters(settings.FriendGroupName ?? "") : "Friends"));
+                lines.Add("FriendMySessionName=" + (includeConnectionHistory
+                    ? RemoveUnsafeIniCharacters(settings.FriendMySessionName ?? "") : ""));
+                lines.Add("FriendNamesB64=" + (includeConnectionHistory
+                    ? EncodeSettingsText(settings.FriendNames ?? "") : ""));
+                lines.Add("FriendRegion=" + (includeConnectionHistory
+                    ? NormalizeFriendRegion(settings.FriendRegion) : "NA"));
+                lines.Add("FriendAutoHost=" + (includeConnectionHistory ? settings.FriendAutoHost.ToString() : "True"));
+                // The full group collection contains identities and shared passwords, so it is
+                // DPAPI-protected in local config.ini and omitted from portable settings exports.
+                lines.Add("FriendGroupsProtected=" + (includeConnectionHistory
+                    ? ProtectLocalSecret(settings.FriendGroupsData ?? "") : ""));
+                lines.Add("FriendActiveGroupId=" + (includeConnectionHistory
+                    ? RemoveUnsafeIniCharacters(settings.FriendActiveGroupId ?? "") : ""));
+                lines.Add("FriendShowOffline=False");
+                lines.Add("FriendShowBadges=" + settings.FriendShowBadges.ToString());
+                lines.Add("NetPlayGameDisplay=" + (string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase) ? "Banners" : "Plain"));
+                // Same-network overrides are deliberately local to this PC. They may contain
+                // private RFC1918 addresses/hostnames and must not ride along in exported
+                // settings or portable .dnlgroup files.
+                lines.Add("FriendLanOverridesB64=" + (includeConnectionHistory
+                    ? EncodeSettingsText(settings.FriendLanOverrides ?? "") : ""));
+                lines.Add("FriendGroupPasswordProtected=" +
+                    (includeConnectionHistory ? ProtectLocalSecret(settings.FriendGroupPassword ?? "") : ""));
                 lines.Add("FirstRunComplete=" + settings.FirstRunComplete.ToString());
                 lines.Add("LibrarySetupAcknowledged=" + settings.LibrarySetupAcknowledged.ToString());
                 lines.Add("CachedDolphinVersion=" + (settings.CachedDolphinVersion ?? ""));
@@ -4562,6 +4672,72 @@ namespace DolphinNetPlayLauncher
                 if (safe != null) safe.Append(c);
             }
             return safe == null ? value : safe.ToString();
+        }
+
+        private static readonly byte[] FriendSecretEntropy =
+            Encoding.UTF8.GetBytes("Dolphin NetPlay Launcher Friend Group v1");
+
+        internal static string ProtectLocalSecret(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return "";
+            try
+            {
+                byte[] plain = Encoding.UTF8.GetBytes(value);
+                byte[] protectedBytes = ProtectedData.Protect(
+                    plain, FriendSecretEntropy, DataProtectionScope.CurrentUser);
+                return Convert.ToBase64String(protectedBytes);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLog.Exception("Could not protect friend-group password", ex);
+                return "";
+            }
+        }
+
+        internal static string UnprotectLocalSecret(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+            try
+            {
+                byte[] protectedBytes = Convert.FromBase64String(value);
+                byte[] plain = ProtectedData.Unprotect(
+                    protectedBytes, FriendSecretEntropy, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(plain);
+            }
+            catch (Exception ex)
+            {
+                // A copied config from another Windows account/PC intentionally cannot
+                // decrypt the CurrentUser DPAPI secret. Keep the group config, clear only
+                // the password, and let the user enter it again.
+                DiagnosticsLog.Exception("Could not unprotect friend-group password; it must be re-entered", ex);
+                return "";
+            }
+        }
+
+        internal static string EncodeSettingsText(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+        }
+
+        internal static string DecodeSettingsText(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            try { return Encoding.UTF8.GetString(Convert.FromBase64String(value)); }
+            catch { return ""; }
+        }
+
+        internal static string NormalizeFriendRegion(string value)
+        {
+            string v = (value ?? "").Trim().ToUpperInvariant();
+            switch (v)
+            {
+                case "EA": case "CN": case "EU": case "NA":
+                case "SA": case "OC": case "AF": return v;
+                default: return "NA";
+            }
         }
 
         private static bool RejectUnsafeIniValue(string label, string value)
@@ -5658,12 +5834,12 @@ namespace DolphinNetPlayLauncher
     {
         public string DolphinExe = "";
         public bool AutoCloseDolphin = true;
-        public int NetPlayCloseGraceMs = 2000;
+        public int NetPlayCloseGraceMs = 1000;
         public int UpdateCloseGraceMs = 1000;
         public bool ShowAutomationWarning = true;
         public bool AutomationIntroSeen = false;
-        public bool AutoReturnAfterFailedJoin = false;
-        public bool ReturnToLauncherAfterDolphinClose = false;
+        public bool AutoReturnAfterFailedJoin = true;
+        public bool ReturnToLauncherAfterDolphinClose = true;
         public bool RememberLastMode = false;
         public string LastMode = "Host";
         // Launcher-owned connection history. Fresh installs intentionally do not import
@@ -5698,6 +5874,35 @@ namespace DolphinNetPlayLauncher
         public string AccentStyle = "AnimatedGradient";
         public bool InterfaceSounds = true;
         public string SoundStyle = "ClassicUI";
+
+        // Optional friend-group discovery uses Dolphin's existing public
+        // lobby. The password lives in memory as plaintext but is DPAPI-protected when
+        // written to this launcher's config.ini and omitted from exported settings.
+        public bool FriendGroupEnabled = false;
+        public string FriendGroupName = "Friends";
+        public string FriendMySessionName = "";
+        public string FriendNames = "";
+        public string FriendGroupPassword = "";
+        public string FriendRegion = "NA";
+        public bool FriendAutoHost = true;
+        // Multiple Friend Groups are stored together as an encrypted local collection.
+        // The legacy flat fields above remain the active-group projection so the proven
+        // discovery / Host / Join code does not need to be duplicated per group.
+        public string FriendGroupsData = "";
+        public string FriendActiveGroupId = "";
+        // Legacy single-group preference retained only for config compatibility. The current workflow no longer
+        // shows offline placeholders in the main Friends roster.
+        public bool FriendShowOffline = false;
+        public bool FriendShowBadges = true;
+        // Game-banner presentation is available for Public Sessions and the main Friends roster.
+        // Banners are the fresh/default presentation; Plain remains a first-class fallback.
+        // Banner artwork is cached outside paint handlers and missing art falls back to text.
+        public string NetPlayGameDisplay = "Banners";
+        // Optional per-PC mapping used only when a configured friend is on the same LAN.
+        // Format is one entry per line: friend-name=host-or-ip[:port]. It is Base64-encoded
+        // in local config.ini and intentionally excluded from exported settings/.dnlgroup.
+        public string FriendLanOverrides = "";
+
         public bool FirstRunComplete = false;
         public bool LibrarySetupAcknowledged = false;
 
@@ -5714,6 +5919,529 @@ namespace DolphinNetPlayLauncher
 
     }
 
+    internal sealed class FriendGroupEntry
+    {
+        public string Id { get; set; }
+        public string GroupName { get; set; }
+        public string Region { get; set; }
+        public string Password { get; set; }
+        public string MySessionName { get; set; }
+        public string FriendNames { get; set; }
+        public bool AutoHost { get; set; }
+        public string LanOverrides { get; set; }
+
+        public FriendGroupEntry()
+        {
+            Id = "";
+            GroupName = "Friends";
+            Region = "NA";
+            Password = "";
+            MySessionName = "";
+            FriendNames = "";
+            AutoHost = true;
+            LanOverrides = "";
+        }
+
+        public override string ToString()
+        {
+            return string.IsNullOrWhiteSpace(GroupName) ? "Friends" : GroupName;
+        }
+    }
+
+    internal static class FriendGroupCollectionCodec
+    {
+        internal static List<FriendGroupEntry> Parse(string raw)
+        {
+            List<FriendGroupEntry> result = new List<FriendGroupEntry>();
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+            try
+            {
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                List<FriendGroupEntry> parsed = serializer.Deserialize<List<FriendGroupEntry>>(raw);
+                if (parsed == null) return result;
+                HashSet<string> ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (FriendGroupEntry entry in parsed)
+                {
+                    if (entry == null) continue;
+                    NormalizeEntry(entry);
+                    if (string.IsNullOrWhiteSpace(entry.Id) || !ids.Add(entry.Id))
+                    {
+                        entry.Id = NewId();
+                        ids.Add(entry.Id);
+                    }
+                    result.Add(entry);
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLog.Exception("Could not parse Friend Group collection", ex);
+            }
+            return result;
+        }
+
+        internal static string Serialize(List<FriendGroupEntry> groups)
+        {
+            try
+            {
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                return serializer.Serialize(groups ?? new List<FriendGroupEntry>());
+            }
+            catch (Exception ex)
+            {
+                DiagnosticsLog.Exception("Could not serialize Friend Group collection", ex);
+                return "";
+            }
+        }
+
+        internal static string NewId()
+        {
+            return Guid.NewGuid().ToString("N");
+        }
+
+        internal static FriendGroupEntry CreateBlank(string name)
+        {
+            FriendGroupEntry entry = new FriendGroupEntry();
+            entry.Id = NewId();
+            entry.GroupName = string.IsNullOrWhiteSpace(name) ? "Friends" : Program.RemoveUnsafeIniCharacters(name).Trim();
+            return entry;
+        }
+
+        internal static void NormalizeEntry(FriendGroupEntry entry)
+        {
+            if (entry == null) return;
+            entry.Id = Program.RemoveUnsafeIniCharacters(entry.Id ?? "").Trim();
+            entry.GroupName = Program.RemoveUnsafeIniCharacters(entry.GroupName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(entry.GroupName)) entry.GroupName = "Friends";
+            entry.Region = Program.NormalizeFriendRegion(entry.Region);
+            entry.Password = Program.RemoveUnsafeIniCharacters(entry.Password ?? "");
+            entry.MySessionName = Program.RemoveUnsafeIniCharacters(entry.MySessionName ?? "").Trim();
+            entry.FriendNames = entry.FriendNames ?? "";
+            entry.LanOverrides = FriendLanOverrideCodec.Normalize(entry.LanOverrides ?? "");
+        }
+
+        internal static FriendGroupEntry FromActiveProjection(DnlSettings settings)
+        {
+            FriendGroupEntry entry = new FriendGroupEntry();
+            entry.Id = !string.IsNullOrWhiteSpace(settings.FriendActiveGroupId)
+                ? settings.FriendActiveGroupId : NewId();
+            entry.GroupName = settings.FriendGroupName;
+            entry.Region = settings.FriendRegion;
+            entry.Password = settings.FriendGroupPassword;
+            entry.MySessionName = settings.FriendMySessionName;
+            entry.FriendNames = settings.FriendNames;
+            entry.AutoHost = settings.FriendAutoHost;
+            entry.LanOverrides = settings.FriendLanOverrides;
+            NormalizeEntry(entry);
+            return entry;
+        }
+
+        internal static void ApplyEntryToSettings(DnlSettings settings, FriendGroupEntry entry)
+        {
+            if (settings == null || entry == null) return;
+            NormalizeEntry(entry);
+            settings.FriendActiveGroupId = entry.Id;
+            settings.FriendGroupName = entry.GroupName;
+            settings.FriendRegion = entry.Region;
+            settings.FriendGroupPassword = entry.Password;
+            settings.FriendMySessionName = entry.MySessionName;
+            settings.FriendNames = entry.FriendNames;
+            settings.FriendAutoHost = entry.AutoHost;
+            settings.FriendLanOverrides = entry.LanOverrides;
+            settings.FriendShowOffline = false;
+        }
+
+        internal static List<FriendGroupEntry> GetGroups(DnlSettings settings)
+        {
+            if (settings == null) return new List<FriendGroupEntry>();
+            List<FriendGroupEntry> groups = Parse(settings.FriendGroupsData);
+            if (groups.Count == 0 && HasLegacyGroupData(settings))
+            {
+                FriendGroupEntry migrated = FromActiveProjection(settings);
+                groups.Add(migrated);
+                settings.FriendActiveGroupId = migrated.Id;
+                settings.FriendGroupsData = Serialize(groups);
+            }
+            return groups;
+        }
+
+        private static bool HasLegacyGroupData(DnlSettings settings)
+        {
+            return settings != null && (settings.FriendGroupEnabled ||
+                !string.IsNullOrWhiteSpace(settings.FriendMySessionName) ||
+                !string.IsNullOrWhiteSpace(settings.FriendNames) ||
+                !string.IsNullOrWhiteSpace(settings.FriendGroupPassword));
+        }
+
+        internal static void EnsureCollectionAndActiveProjection(DnlSettings settings)
+        {
+            if (settings == null) return;
+            List<FriendGroupEntry> groups = GetGroups(settings);
+            if (groups.Count == 0)
+            {
+                settings.FriendActiveGroupId = "";
+                return;
+            }
+            FriendGroupEntry active = FindById(groups, settings.FriendActiveGroupId) ?? groups[0];
+            ApplyEntryToSettings(settings, active);
+            settings.FriendGroupsData = Serialize(groups);
+        }
+
+        internal static void CaptureActiveProjection(DnlSettings settings)
+        {
+            if (settings == null) return;
+            List<FriendGroupEntry> groups = GetGroups(settings);
+            if (groups.Count == 0)
+            {
+                if (!HasLegacyGroupData(settings)) return;
+                FriendGroupEntry first = FromActiveProjection(settings);
+                groups.Add(first);
+                settings.FriendActiveGroupId = first.Id;
+            }
+            FriendGroupEntry active = FindById(groups, settings.FriendActiveGroupId);
+            if (active == null)
+            {
+                active = FromActiveProjection(settings);
+                groups.Add(active);
+                settings.FriendActiveGroupId = active.Id;
+            }
+            CopyProjectionIntoEntry(settings, active);
+            settings.FriendGroupsData = Serialize(groups);
+        }
+
+        internal static bool Activate(DnlSettings settings, string id)
+        {
+            if (settings == null || string.IsNullOrWhiteSpace(id)) return false;
+            CaptureActiveProjection(settings);
+            List<FriendGroupEntry> groups = Parse(settings.FriendGroupsData);
+            FriendGroupEntry next = FindById(groups, id);
+            if (next == null) return false;
+            ApplyEntryToSettings(settings, next);
+            settings.FriendGroupsData = Serialize(groups);
+            return true;
+        }
+
+        internal static FriendGroupEntry UpsertImported(DnlSettings settings, FriendGroupProfile profile, string self)
+        {
+            if (settings == null || profile == null) return null;
+            CaptureActiveProjection(settings);
+            List<FriendGroupEntry> groups = Parse(settings.FriendGroupsData);
+            FriendGroupEntry target = null;
+            foreach (FriendGroupEntry existing in groups)
+            {
+                if (existing != null && string.Equals(existing.GroupName, profile.GroupName, StringComparison.OrdinalIgnoreCase))
+                {
+                    target = existing;
+                    break;
+                }
+            }
+            if (target == null)
+            {
+                target = CreateBlank(profile.GroupName);
+                groups.Add(target);
+            }
+            string keepLan = target.LanOverrides ?? "";
+            target.GroupName = profile.GroupName;
+            target.Region = profile.Region;
+            target.Password = profile.Password;
+            target.MySessionName = Program.RemoveUnsafeIniCharacters(self ?? "").Trim();
+            target.FriendNames = FriendGroupProfileFile.BuildFriendListExcluding(profile, target.MySessionName);
+            target.AutoHost = true;
+            target.LanOverrides = keepLan;
+            NormalizeEntry(target);
+            settings.FriendGroupEnabled = true;
+            settings.FriendActiveGroupId = target.Id;
+            settings.FriendGroupsData = Serialize(groups);
+            ApplyEntryToSettings(settings, target);
+            FriendBadgeStore.ImportProfileBadges(profile);
+            return target;
+        }
+
+        internal static FriendGroupEntry FindById(List<FriendGroupEntry> groups, string id)
+        {
+            if (groups == null || string.IsNullOrWhiteSpace(id)) return null;
+            foreach (FriendGroupEntry entry in groups)
+                if (entry != null && string.Equals(entry.Id, id, StringComparison.OrdinalIgnoreCase)) return entry;
+            return null;
+        }
+
+        internal static string MakeUniqueName(List<FriendGroupEntry> groups, string baseName)
+        {
+            string root = string.IsNullOrWhiteSpace(baseName) ? "New Group" : baseName.Trim();
+            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (groups != null)
+                foreach (FriendGroupEntry entry in groups)
+                    if (entry != null && !string.IsNullOrWhiteSpace(entry.GroupName)) names.Add(entry.GroupName);
+            if (!names.Contains(root)) return root;
+            int n = 2;
+            while (names.Contains(root + " " + n.ToString())) n++;
+            return root + " " + n.ToString();
+        }
+
+        private static void CopyProjectionIntoEntry(DnlSettings settings, FriendGroupEntry entry)
+        {
+            if (settings == null || entry == null) return;
+            entry.GroupName = settings.FriendGroupName;
+            entry.Region = settings.FriendRegion;
+            entry.Password = settings.FriendGroupPassword;
+            entry.MySessionName = settings.FriendMySessionName;
+            entry.FriendNames = settings.FriendNames;
+            entry.AutoHost = settings.FriendAutoHost;
+            entry.LanOverrides = settings.FriendLanOverrides;
+            NormalizeEntry(entry);
+        }
+    }
+
+    internal sealed class FriendLanEndpoint
+    {
+        public string Address = "";
+        public int Port = 2626;
+    }
+
+    internal static class FriendLanOverrideCodec
+    {
+        internal static bool TryGet(string raw, string friendName, out FriendLanEndpoint endpoint)
+        {
+            endpoint = null;
+            if (string.IsNullOrWhiteSpace(raw) || string.IsNullOrWhiteSpace(friendName)) return false;
+            Dictionary<string, FriendLanEndpoint> all = Parse(raw);
+            return all.TryGetValue(friendName.Trim(), out endpoint) && endpoint != null;
+        }
+
+        internal static Dictionary<string, FriendLanEndpoint> Parse(string raw)
+        {
+            Dictionary<string, FriendLanEndpoint> result =
+                new Dictionary<string, FriendLanEndpoint>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+
+            string normalized = raw.Replace("\r", "\n");
+            foreach (string part in normalized.Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = (part ?? "").Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                int eq = line.IndexOf('=');
+                if (eq <= 0 || eq >= line.Length - 1) continue;
+
+                string name = Program.RemoveUnsafeIniCharacters(line.Substring(0, eq)).Trim();
+                string value = line.Substring(eq + 1).Trim();
+                string address;
+                int port;
+                if (name.Length == 0 || !TryParseEndpoint(value, out address, out port)) continue;
+
+                FriendLanEndpoint endpoint = new FriendLanEndpoint();
+                endpoint.Address = address;
+                endpoint.Port = port;
+                result[name] = endpoint;
+            }
+            return result;
+        }
+
+        internal static string Normalize(string raw)
+        {
+            return Serialize(Parse(raw));
+        }
+
+        internal static string Serialize(Dictionary<string, FriendLanEndpoint> parsed)
+        {
+            if (parsed == null || parsed.Count == 0) return "";
+            List<string> names = new List<string>(parsed.Keys);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            List<string> lines = new List<string>();
+            foreach (string name in names)
+            {
+                FriendLanEndpoint endpoint = parsed[name];
+                if (endpoint == null || string.IsNullOrWhiteSpace(endpoint.Address)) continue;
+                string address = endpoint.Address.Trim();
+                IPAddress ip;
+                if (IPAddress.TryParse(address, out ip) && address.IndexOf(':') >= 0)
+                    address = "[" + address + "]";
+                lines.Add(name + "=" + address + ":" + endpoint.Port.ToString());
+            }
+            return string.Join(Environment.NewLine, lines.ToArray());
+        }
+
+        private static bool TryParseEndpoint(string value, out string address, out int port)
+        {
+            address = "";
+            port = 2626;
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            string text = value.Trim();
+
+            if (text.StartsWith("[", StringComparison.Ordinal))
+            {
+                int close = text.IndexOf(']');
+                if (close <= 1) return false;
+                address = text.Substring(1, close - 1).Trim();
+                string tail = text.Substring(close + 1).Trim();
+                if (tail.Length > 0)
+                {
+                    if (!tail.StartsWith(":", StringComparison.Ordinal)) return false;
+                    int parsedPort;
+                    if (!int.TryParse(tail.Substring(1), out parsedPort) || parsedPort < 1 || parsedPort > 65535)
+                        return false;
+                    port = parsedPort;
+                }
+            }
+            else
+            {
+                int firstColon = text.IndexOf(':');
+                int lastColon = text.LastIndexOf(':');
+                if (firstColon > 0 && firstColon == lastColon)
+                {
+                    int parsedPort;
+                    string maybePort = text.Substring(lastColon + 1);
+                    if (int.TryParse(maybePort, out parsedPort))
+                    {
+                        if (parsedPort < 1 || parsedPort > 65535) return false;
+                        address = text.Substring(0, lastColon).Trim();
+                        port = parsedPort;
+                    }
+                    else
+                        address = text;
+                }
+                else
+                    address = text;
+            }
+
+            if (string.IsNullOrWhiteSpace(address) || Program.ContainsUnsafeIniCharacters(address)) return false;
+            IPAddress ip;
+            if (IPAddress.TryParse(address, out ip)) return true;
+            return Uri.CheckHostName(address) != UriHostNameType.Unknown && address.Length <= 255;
+        }
+    }
+
+    internal static class FriendBadgeStore
+    {
+        private static string BadgeDirectory
+        {
+            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FriendBadges"); }
+        }
+
+        internal static string GetPath(string friendName)
+        {
+            string normalized = (friendName ?? "").Trim().ToUpperInvariant();
+            if (normalized.Length == 0) return "";
+            byte[] hash;
+            using (SHA256 sha = SHA256.Create())
+                hash = sha.ComputeHash(Encoding.UTF8.GetBytes(normalized));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 8; i++) sb.Append(hash[i].ToString("x2"));
+            return Path.Combine(BadgeDirectory, "friend-" + sb.ToString() + ".png");
+        }
+
+        internal static bool TryReadBase64(string friendName, out string base64)
+        {
+            base64 = "";
+            try
+            {
+                string path = GetPath(friendName);
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return false;
+                byte[] bytes = File.ReadAllBytes(path);
+                if (bytes.Length == 0 || bytes.Length > 256 * 1024) return false;
+                base64 = Convert.ToBase64String(bytes);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        internal static bool TryImportBase64(string friendName, string base64)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(friendName) || string.IsNullOrWhiteSpace(base64)) return false;
+                byte[] bytes = Convert.FromBase64String(base64);
+                if (bytes.Length == 0 || bytes.Length > 256 * 1024) return false;
+                using (MemoryStream ms = new MemoryStream(bytes))
+                using (Image source = Image.FromStream(ms))
+                {
+                    string error;
+                    return TrySaveImage(friendName, source, out error);
+                }
+            }
+            catch { return false; }
+        }
+
+        internal static void ImportProfileBadges(FriendGroupProfile profile)
+        {
+            if (profile == null || profile.Badges == null) return;
+            foreach (KeyValuePair<string, string> pair in profile.Badges)
+            {
+                if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value)) continue;
+                TryImportBase64(pair.Key, pair.Value);
+            }
+        }
+
+        internal static bool TrySave(string friendName, string sourcePath, out string error)
+        {
+            error = "";
+            try
+            {
+                if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+                {
+                    error = "Choose a valid member and image file.";
+                    return false;
+                }
+                using (Image source = Image.FromFile(sourcePath))
+                    return TrySaveImage(friendName, source, out error);
+            }
+            catch (Exception ex)
+            {
+                error = "Could not save custom friend badge:\n" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static bool TrySaveImage(string friendName, Image source, out string error)
+        {
+            error = "";
+            try
+            {
+                string target = GetPath(friendName);
+                if (string.IsNullOrWhiteSpace(target) || source == null)
+                {
+                    error = "Choose a valid member and image.";
+                    return false;
+                }
+                Directory.CreateDirectory(BadgeDirectory);
+                using (Bitmap badge = new Bitmap(64, 64, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+                using (Graphics g = Graphics.FromImage(badge))
+                {
+                    g.Clear(Color.Transparent);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    int side = Math.Min(source.Width, source.Height);
+                    int sx = Math.Max(0, (source.Width - side) / 2);
+                    int sy = Math.Max(0, (source.Height - side) / 2);
+                    using (GraphicsPath clip = new GraphicsPath())
+                    {
+                        clip.AddEllipse(0, 0, 64, 64);
+                        g.SetClip(clip);
+                        g.DrawImage(source, new Rectangle(0, 0, 64, 64),
+                            new Rectangle(sx, sy, side, side), GraphicsUnit.Pixel);
+                        g.ResetClip();
+                    }
+                    badge.Save(target, System.Drawing.Imaging.ImageFormat.Png);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "Could not save custom friend badge:\n" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static void Delete(string friendName)
+        {
+            try
+            {
+                string path = GetPath(friendName);
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path)) File.Delete(path);
+            }
+            catch { }
+        }
+    }
+
     internal sealed class DolphinPaths
     {
         public string DolphinExe;
@@ -5728,6 +6456,321 @@ namespace DolphinNetPlayLauncher
         public string UserTitleDb;
         public string UserTitles;
         public string GameCoversDir;
+    }
+
+    internal sealed class SessionGamePresentation
+    {
+        public string Title = "";
+        public string GameId = "";
+        public int Revision;
+        public bool HasRevision;
+
+        internal string MetadataText
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(GameId)) return "";
+                return HasRevision ? GameId + "  •  Revision " + Revision.ToString() : GameId;
+            }
+        }
+    }
+
+    // Shared read-mostly banner cache for Sessions and Friends. The hot owner-draw
+    // handlers only query this cache; all disk/cache decoding happens from the existing
+    // background session/friend refresh workers. This preserves the RC31-RC40 performance
+    // rule that painting must never perform filesystem I/O or image decoding.
+    internal sealed class SessionBannerCatalog : IDisposable
+    {
+        private readonly object sync = new object();
+        // Keep the library-index lock separate from the hot image-cache lock. Building
+        // the local metadata/banner index can touch disk and must never block owner-draw
+        // GetCached() calls on the UI thread.
+        private readonly object indexSync = new object();
+        private readonly DolphinPaths paths;
+        private readonly List<string> gamePaths;
+        private readonly Dictionary<string, string> pathByGameId =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> pathByTitle =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, Image> cache =
+            new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> missing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> loading = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private bool indexBuilt;
+        private bool disposed;
+
+        internal SessionBannerCatalog(DolphinPaths paths, IEnumerable<string> gamePaths)
+        {
+            this.paths = paths;
+            this.gamePaths = gamePaths != null ? new List<string>(gamePaths) : new List<string>();
+        }
+
+        internal static string OverrideDirectory
+        {
+            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SessionBanners"); }
+        }
+
+        internal static SessionGamePresentation ParseGame(string advertised)
+        {
+            SessionGamePresentation result = new SessionGamePresentation();
+            string raw = (advertised ?? "").Trim();
+            result.Title = raw;
+            if (raw.Length == 0) return result;
+
+            Match match = Regex.Match(raw,
+                @"^(?<title>.+?)\s+\((?<id>[A-Za-z0-9]{3,8})(?:,\s*Revision\s+(?<rev>\d+))?(?:,\s*Disc\s+(?<disc>\d+))?\)\s*$",
+                RegexOptions.CultureInvariant);
+            if (!match.Success) return result;
+
+            result.Title = match.Groups["title"].Value.Trim();
+            result.GameId = match.Groups["id"].Value.Trim().ToUpperInvariant();
+            int revision;
+            if (match.Groups["rev"].Success && int.TryParse(match.Groups["rev"].Value, out revision))
+            {
+                result.Revision = revision;
+                result.HasRevision = true;
+            }
+            return result;
+        }
+
+        private static string NormalizeTitleKey(string value)
+        {
+            return (value ?? "").Trim();
+        }
+
+        private static string SafeFileStem(string value)
+        {
+            string text = (value ?? "").Trim();
+            foreach (char c in Path.GetInvalidFileNameChars()) text = text.Replace(c, '_');
+            return text.Length > 120 ? text.Substring(0, 120) : text;
+        }
+
+        private void EnsureIndexBuilt()
+        {
+            lock (indexSync)
+            {
+                if (indexBuilt) return;
+
+                Dictionary<string, LibraryMetadataRecord> records = Program.LoadLibraryMetadataCache();
+
+                // The launcher intentionally does not populate allGames during
+                // startup. Preserve that fast-start behavior, but still make any metadata
+                // cache from previous Games use available to title/path fallback matching.
+                foreach (KeyValuePair<string, LibraryMetadataRecord> pair in records)
+                {
+                    string cachedPath = pair.Key;
+                    LibraryMetadataRecord record = pair.Value;
+                    if (string.IsNullOrWhiteSpace(cachedPath) || record == null) continue;
+                    if (!string.IsNullOrWhiteSpace(record.GameId) && !pathByGameId.ContainsKey(record.GameId.Trim()))
+                        pathByGameId[record.GameId.Trim()] = cachedPath;
+                    if (!string.IsNullOrWhiteSpace(record.Title) && !pathByTitle.ContainsKey(NormalizeTitleKey(record.Title)))
+                        pathByTitle[NormalizeTitleKey(record.Title)] = cachedPath;
+                }
+
+                foreach (string gamePath in gamePaths)
+                {
+                    if (string.IsNullOrWhiteSpace(gamePath)) continue;
+                    LibraryMetadataRecord record;
+                    if (records.TryGetValue(gamePath, out record) && record != null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(record.GameId) && !pathByGameId.ContainsKey(record.GameId.Trim()))
+                            pathByGameId[record.GameId.Trim()] = gamePath;
+                        if (!string.IsNullOrWhiteSpace(record.Title) && !pathByTitle.ContainsKey(NormalizeTitleKey(record.Title)))
+                            pathByTitle[NormalizeTitleKey(record.Title)] = gamePath;
+                    }
+
+                    string fileTitle = "";
+                    try { fileTitle = Path.GetFileNameWithoutExtension(gamePath); } catch { }
+                    if (!string.IsNullOrWhiteSpace(fileTitle) && !pathByTitle.ContainsKey(NormalizeTitleKey(fileTitle)))
+                        pathByTitle[NormalizeTitleKey(fileTitle)] = gamePath;
+                }
+
+                indexBuilt = true;
+            }
+        }
+
+        private static Bitmap NormalizeBanner(Image source)
+        {
+            if (source == null || source.Width <= 0 || source.Height <= 0) return null;
+            const int width = 144;
+            const int height = 48;
+            Bitmap result = new Bitmap(width, height);
+            using (Graphics g = Graphics.FromImage(result))
+            {
+                g.Clear(Color.Black);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                double scale = Math.Min((double)width / source.Width, (double)height / source.Height);
+                int drawWidth = Math.Max(1, (int)Math.Round(source.Width * scale));
+                int drawHeight = Math.Max(1, (int)Math.Round(source.Height * scale));
+                int x = (width - drawWidth) / 2;
+                int y = (height - drawHeight) / 2;
+                g.DrawImage(source, new Rectangle(x, y, drawWidth, drawHeight));
+            }
+            return result;
+        }
+
+        private string ResolveLocalPath(SessionGamePresentation info)
+        {
+            EnsureIndexBuilt();
+            lock (indexSync)
+            {
+                string path;
+                if (!string.IsNullOrWhiteSpace(info.GameId) && pathByGameId.TryGetValue(info.GameId, out path))
+                    return path;
+                if (!string.IsNullOrWhiteSpace(info.Title) && pathByTitle.TryGetValue(NormalizeTitleKey(info.Title), out path))
+                    return path;
+                return "";
+            }
+        }
+
+        private static string CacheKey(SessionGamePresentation info, string advertised)
+        {
+            if (info != null && !string.IsNullOrWhiteSpace(info.GameId)) return "ID:" + info.GameId;
+            return "NAME:" + (advertised ?? "").Trim();
+        }
+
+        private Image LoadOverride(SessionGamePresentation info, string advertised)
+        {
+            string[] candidates = new string[]
+            {
+                !string.IsNullOrWhiteSpace(info.GameId) ? info.GameId + ".png" : "",
+                !string.IsNullOrWhiteSpace(info.Title) ? SafeFileStem(info.Title) + ".png" : "",
+                !string.IsNullOrWhiteSpace(advertised) ? SafeFileStem(advertised) + ".png" : ""
+            };
+            foreach (string candidate in candidates)
+            {
+                if (string.IsNullOrWhiteSpace(candidate)) continue;
+                string file = Path.Combine(OverrideDirectory, candidate);
+                if (!File.Exists(file)) continue;
+                try
+                {
+                    using (Image source = Image.FromFile(file))
+                        return NormalizeBanner(source);
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        internal void Preload(IEnumerable<PublicNetPlaySession> sessions)
+        {
+            if (sessions == null) return;
+            foreach (PublicNetPlaySession session in sessions)
+            {
+                if (session == null || string.IsNullOrWhiteSpace(session.Game)) continue;
+                EnsureLoaded(session.Game);
+            }
+        }
+
+        private void EnsureLoaded(string advertised)
+        {
+            SessionGamePresentation info = ParseGame(advertised);
+            string key = CacheKey(info, advertised);
+            lock (sync)
+            {
+                if (disposed || cache.ContainsKey(key) || missing.Contains(key) || loading.Contains(key)) return;
+                loading.Add(key);
+            }
+
+            // Do every potentially expensive operation outside the hot cache lock.
+            // Owner-draw GetCached() calls can therefore return immediately even while
+            // a background refresh is reading Dolphin metadata or decoding artwork.
+            Image loaded = null;
+            try
+            {
+                // Normal Dolphin NetPlay names already advertise the Game ID.
+                // Resolve that directly against Dolphin's gamelist.cache so banner mode
+                // works before the user ever opens the launcher's Games panel.
+                if (!string.IsNullOrWhiteSpace(info.GameId))
+                {
+                    try
+                    {
+                        using (Image source = Program.TryLoadBannerFromGameListCacheByGameId(paths, info.GameId))
+                        {
+                            if (source != null) loaded = NormalizeBanner(source);
+                        }
+                    }
+                    catch { }
+                }
+
+                // Title/path matching remains a fallback for nonstandard advertised names.
+                if (loaded == null)
+                {
+                    string localPath = ResolveLocalPath(info);
+                    if (!string.IsNullOrWhiteSpace(localPath))
+                    {
+                        try
+                        {
+                            using (Image source = Program.TryLoadBannerFromGameListCache(paths, localPath))
+                            {
+                                if (source != null) loaded = NormalizeBanner(source);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (loaded == null) loaded = LoadOverride(info, advertised);
+            }
+            catch { }
+
+            lock (sync)
+            {
+                loading.Remove(key);
+                if (!disposed)
+                {
+                    if (loaded != null)
+                    {
+                        cache[key] = loaded;
+                        loaded = null; // cache now owns the image
+                    }
+                    else
+                        missing.Add(key);
+                }
+            }
+
+            // Dispose an image that completed after the catalog itself was disposed.
+            if (loaded != null)
+            {
+                try { loaded.Dispose(); } catch { }
+            }
+        }
+
+        internal Image GetCached(string advertised)
+        {
+            if (string.IsNullOrWhiteSpace(advertised)) return null;
+            SessionGamePresentation info = ParseGame(advertised);
+            string key = CacheKey(info, advertised);
+            lock (sync)
+            {
+                if (disposed) return null;
+                Image image;
+                return cache.TryGetValue(key, out image) ? image : null;
+            }
+        }
+
+        internal void ClearMissingForManualOverrides()
+        {
+            lock (sync) missing.Clear();
+        }
+
+        public void Dispose()
+        {
+            lock (sync)
+            {
+                disposed = true;
+                foreach (Image image in cache.Values)
+                {
+                    if (image == null) continue;
+                    try { image.Dispose(); } catch { }
+                }
+                cache.Clear();
+                missing.Clear();
+                loading.Clear();
+            }
+        }
     }
 
     internal enum LaunchMode { Host, Join }
@@ -6355,6 +7398,13 @@ namespace DolphinNetPlayLauncher
         private static readonly Dictionary<string, DateTime> LastPlayUtc =
             new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
+        // Mouse sound parity is wired separately from Click so controller PerformClick()
+        // does not accidentally trigger a second copy of the same cue. Controls are
+        // tracked for the lifetime of the form to avoid duplicate event subscriptions
+        // when dynamic panels (notably Sessions) are added later.
+        private static readonly HashSet<Control> MouseSoundControls = new HashSet<Control>();
+        private static readonly HashSet<Control> MouseSoundContainers = new HashSet<Control>();
+
         public static string SoundsFolder
         {
             get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Sounds"); }
@@ -6608,6 +7658,286 @@ namespace DolphinNetPlayLauncher
         public static void PlaySessionsOpen(DnlSettings settings) { PlayNamed(settings, "library_open"); }
         public static void PlaySessionsClose(DnlSettings settings) { PlayNamed(settings, "library_close"); }
 
+        public static void AttachMouseInteractionSounds(Control root, DnlSettings settings)
+        {
+            if (root == null || settings == null) return;
+            WireMouseInteractionSoundsRecursive(root, settings);
+        }
+
+        private static void WireMouseInteractionSoundsRecursive(Control control, DnlSettings settings)
+        {
+            if (control == null) return;
+
+            ButtonBase buttonBase = control as ButtonBase;
+            if (buttonBase != null)
+                WireMouseButtonSound(buttonBase, settings);
+
+            bool wireContainer = false;
+            lock (Sync)
+            {
+                if (!MouseSoundContainers.Contains(control))
+                {
+                    MouseSoundContainers.Add(control);
+                    wireContainer = true;
+                }
+            }
+
+            if (wireContainer)
+            {
+                control.ControlAdded += delegate(object sender, ControlEventArgs e)
+                {
+                    if (e != null && e.Control != null)
+                        WireMouseInteractionSoundsRecursive(e.Control, settings);
+                };
+                control.Disposed += delegate
+                {
+                    lock (Sync)
+                    {
+                        MouseSoundContainers.Remove(control);
+                        MouseSoundControls.Remove(control);
+                    }
+                };
+            }
+
+            foreach (Control child in control.Controls)
+                WireMouseInteractionSoundsRecursive(child, settings);
+        }
+
+        private static void WireMouseButtonSound(ButtonBase buttonBase, DnlSettings settings)
+        {
+            bool wire = false;
+            lock (Sync)
+            {
+                if (!MouseSoundControls.Contains(buttonBase))
+                {
+                    MouseSoundControls.Add(buttonBase);
+                    wire = true;
+                }
+            }
+            if (!wire) return;
+
+            bool radioWasChecked = false;
+            bool libraryWasVisible = false;
+            bool mouseDownSoundPlayed = false;
+
+            buttonBase.MouseDown += delegate(object sender, MouseEventArgs e)
+            {
+                if (e == null || e.Button != MouseButtons.Left) return;
+
+                mouseDownSoundPlayed = false;
+
+                RadioButton radio = buttonBase as RadioButton;
+                if (radio != null)
+                    radioWasChecked = radio.Checked;
+
+                LauncherForm launcher = buttonBase.FindForm() as LauncherForm;
+                if (launcher != null)
+                    libraryWasVisible = launcher.IsLibraryVisible;
+
+                // These buttons can close/dispose their form from Click. Play their
+                // mouse-only cue on press so the cue is not lost with the form.
+                Button button = buttonBase as Button;
+                if (button != null)
+                {
+                    // Options OK/Cancel use one form-closing-owned terminal cue so mouse,
+                    // keyboard and controller activation all converge on one sound.
+                    if (IsOptionsDialogActionButton(button))
+                    {
+                        mouseDownSoundPlayed = true;
+                        return;
+                    }
+
+                    string label = NormalizeButtonLabel(button.Text);
+                    Form owner = button.FindForm();
+                    if (label.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                        label.Equals("Join", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PlayNamed(settings, "launch");
+                        mouseDownSoundPlayed = true;
+                    }
+                    else if (label.Equals("Cancel", StringComparison.OrdinalIgnoreCase) ||
+                             label.Equals("Close", StringComparison.OrdinalIgnoreCase) ||
+                             button.DialogResult == DialogResult.Cancel ||
+                             (owner != null && object.ReferenceEquals(owner.CancelButton, button)))
+                    {
+                        // Treat dialog cancellation semantically, not only by button text.
+                        PlayNamed(settings, "cancel");
+                        mouseDownSoundPlayed = true;
+                    }
+                    else if (label.Equals("Use for Join", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PublicSessionsForm sessions = button.FindForm() as PublicSessionsForm;
+                        if (sessions != null && !sessions.IsEmbeddedMode)
+                        {
+                            PlayNamed(settings, "confirm");
+                            mouseDownSoundPlayed = true;
+                        }
+                    }
+                    else
+                    {
+                        bool closesDialog = button.DialogResult != DialogResult.None ||
+                            (owner != null && object.ReferenceEquals(owner.AcceptButton, button));
+                        if (closesDialog)
+                        {
+                            // Dialog-style primary actions may close/dispose their form
+                            // from Click, so give them the generic controller-equivalent
+                            // confirm cue before that happens.
+                            PlayNamed(settings, "confirm");
+                            mouseDownSoundPlayed = true;
+                        }
+                    }
+                }
+            };
+
+            buttonBase.MouseClick += delegate(object sender, MouseEventArgs e)
+            {
+                if (e == null || e.Button != MouseButtons.Left)
+                    return;
+
+                RadioButton radio = buttonBase as RadioButton;
+                if (radio != null)
+                {
+                    if (!radioWasChecked && radio.Checked)
+                        PlayNamed(settings, "switch");
+                    return;
+                }
+
+                CheckBox check = buttonBase as CheckBox;
+                if (check != null)
+                {
+                    // Host -> PUBLIC HOSTING toggles are intentionally calmer than ordinary
+                    // setting switches: they use Navigate. Other checkbox toggles keep the
+                    // Switch semantic (the bundled themes use a deliberately softer selection cue).
+                    PlayNamed(settings, IsPublicHostingToggle(check) ? "navigate" : "switch");
+                    return;
+                }
+
+                Button button = buttonBase as Button;
+                if (button != null)
+                {
+                    if (mouseDownSoundPlayed) return;
+                    PlayMouseButtonCue(settings, button, libraryWasVisible);
+                }
+            };
+        }
+
+        private static bool IsPublicHostingToggle(CheckBox check)
+        {
+            if (check == null) return false;
+            AdventureGroupBox group = check.Parent as AdventureGroupBox;
+            if (group == null || !string.Equals((group.Text ?? "").Trim(), "PUBLIC HOSTING", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string label = NormalizeButtonLabel(check.Text);
+            return label.Equals("Use friend group", StringComparison.OrdinalIgnoreCase) ||
+                   label.Equals("Show in Server Browser", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsOptionsDialogActionButton(Button button)
+        {
+            return IsOptionsDialogActionButton(button != null ? button.FindForm() : null, button);
+        }
+
+        private static bool IsOptionsDialogActionButton(Form form, Button button)
+        {
+            if (button == null) return false;
+            OptionsForm options = form as OptionsForm;
+            if (options == null) return false;
+
+            return button.DialogResult == DialogResult.OK ||
+                   button.DialogResult == DialogResult.Cancel ||
+                   (options.AcceptButton != null && object.ReferenceEquals(options.AcceptButton, button)) ||
+                   (options.CancelButton != null && object.ReferenceEquals(options.CancelButton, button));
+        }
+
+        private static string NormalizeButtonLabel(string text)
+        {
+            return (text ?? "").Replace("▶", "").Trim();
+        }
+
+        private static void PlayMouseButtonCue(DnlSettings settings, Button button, bool libraryWasVisible)
+        {
+            if (button == null) return;
+            if (IsOptionsDialogActionButton(button)) return;
+
+            string label = NormalizeButtonLabel(button.Text);
+
+            if (string.Equals(button.Tag as string, "SoundNavigate", StringComparison.Ordinal))
+            {
+                PlayNamed(settings, "navigate");
+                return;
+            }
+
+            // These cues are already owned by their action handler so mouse, controller,
+            // and programmatic activation all converge on exactly one sound. Options/Group
+            // open a synchronous modal; their opener cue is owned by OptionsRequested before
+            // ShowDialog() begins so MouseClick cannot replay it after the dialog closes.
+            if (label.Equals("Sessions...", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Test", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Options...", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Group...", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            // Options is a settings surface, not a sequence of affirmative
+            // commits. Its ordinary buttons use the same neutral Navigate cue as Refresh.
+            // OK/Cancel are excluded above by IsOptionsDialogActionButton(), while Test
+            // intentionally owns its selected-theme sample in its Click handler.
+            if (button.FindForm() is OptionsForm)
+            {
+                PlayNamed(settings, "navigate");
+                return;
+            }
+
+            PublicSessionsForm sessions = button.FindForm() as PublicSessionsForm;
+            if (label.Equals("Hide", StringComparison.OrdinalIgnoreCase) &&
+                sessions != null && sessions.IsEmbeddedMode)
+                return;
+
+            if (label.Equals("Use for Join", StringComparison.OrdinalIgnoreCase) &&
+                sessions != null && sessions.IsEmbeddedMode)
+            {
+                // The embedded successful-session path already owns its confirm cue.
+                return;
+            }
+
+            // Host/Join and Cancel/Close were played on MouseDown because those actions
+            // may dispose the form before MouseClick can finish.
+            if (label.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Join", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Cancel", StringComparison.OrdinalIgnoreCase) ||
+                label.Equals("Close", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if (label.Equals("Games...", StringComparison.OrdinalIgnoreCase))
+            {
+                PlayNamed(settings, libraryWasVisible ? "library_close" : "library_open");
+                return;
+            }
+            if (label.Equals("Hide", StringComparison.OrdinalIgnoreCase))
+            {
+                PlayNamed(settings, "library_close");
+                return;
+            }
+            if (label.Equals("Use Game", StringComparison.OrdinalIgnoreCase))
+            {
+                PlayNamed(settings, "use_game");
+                return;
+            }
+            if (label.Equals("Clear", StringComparison.OrdinalIgnoreCase))
+            {
+                PlayNamed(settings, "clear_game");
+                return;
+            }
+            if (label.Equals("Refresh", StringComparison.OrdinalIgnoreCase))
+            {
+                // Refresh is a neutral UI action rather than an affirmative/commit action.
+                PlayNamed(settings, "navigate");
+                return;
+            }
+
+            PlayNamed(settings, "confirm");
+        }
+
         public static void PlayForControllerAction(
             Form form,
             DnlSettings settings,
@@ -6647,10 +7977,52 @@ namespace DolphinNetPlayLauncher
                     return;
                 }
 
+                CheckBox check = beforeControl as CheckBox;
+                if (check != null)
+                {
+                    PlayNamed(settings, IsPublicHostingToggle(check) ? "navigate" : "switch");
+                    return;
+                }
+
+                if (beforeControl is RadioButton)
+                {
+                    PlayNamed(settings, "switch");
+                    return;
+                }
+
                 Button button = beforeControl as Button;
                 if (button != null)
                 {
                     string label = (button.Text ?? "").Replace("▶", "").Trim();
+                    Form owner = button.FindForm();
+
+                    if (string.Equals(button.Tag as string, "SoundNavigate", StringComparison.Ordinal))
+                    {
+                        PlayNamed(settings, "navigate");
+                        return;
+                    }
+
+                    // Options OK/Cancel play exactly once from OptionsForm.OnFormClosing.
+                    // Use the known form + pre-action control instead of button.FindForm():
+                    // PerformClick() may already have started closing the modal by the
+                    // time controller sound routing runs.
+                    if (IsOptionsDialogActionButton(form, button))
+                        return;
+
+                    if (label.Equals("Test", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // The sound-theme Test button plays the selected theme's confirm
+                        // cue in its own Click handler. Do not stack a second sound.
+                        return;
+                    }
+                    if (form is OptionsForm)
+                    {
+                        // All ordinary Options buttons are neutral settings/utility
+                        // actions. Resolve this before generic labels such as Clear so the
+                        // Options surface follows one consistent sound policy.
+                        PlayNamed(settings, "navigate");
+                        return;
+                    }
 
                     if (label.Equals("Use Game", StringComparison.OrdinalIgnoreCase))
                     {
@@ -6660,6 +8032,11 @@ namespace DolphinNetPlayLauncher
                     if (label.Equals("Clear", StringComparison.OrdinalIgnoreCase))
                     {
                         PlayNamed(settings, "clear_game");
+                        return;
+                    }
+                    if (label.Equals("Refresh", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PlayNamed(settings, "navigate");
                         return;
                     }
                     if (label.Equals("Games...", StringComparison.OrdinalIgnoreCase))
@@ -6672,6 +8049,14 @@ namespace DolphinNetPlayLauncher
                         // The Sessions panel itself owns its open/close sound.
                         return;
                     }
+                    if (label.Equals("Options...", StringComparison.OrdinalIgnoreCase) ||
+                        label.Equals("Group...", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // OptionsRequested owns this cue before synchronous ShowDialog().
+                        // Controller sound routing resumes only after the dialog closes, so
+                        // replaying here would stack with the terminal OK/Cancel cue.
+                        return;
+                    }
                     if (label.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
                         label.Equals("Join", StringComparison.OrdinalIgnoreCase))
                     {
@@ -6680,16 +8065,35 @@ namespace DolphinNetPlayLauncher
                     }
                     if (label.Equals("Hide", StringComparison.OrdinalIgnoreCase))
                     {
-                        // Embedded Sessions Hide plays Back in its click handler so mouse
-                        // and controller activation share exactly one sound.
+                        PublicSessionsForm sessionsForm = button.FindForm() as PublicSessionsForm;
+                        if (sessionsForm != null && sessionsForm.IsEmbeddedMode)
+                        {
+                            // Embedded Sessions Hide plays Back in its click handler so mouse
+                            // and controller activation share exactly one sound.
+                            return;
+                        }
+
+                        // The Games panel also has a Hide button; that is a panel-close
+                        // action and should use the same close cue as Games... toggling off.
+                        PlayNamed(settings, "library_close");
                         return;
                     }
                     if (label.Equals("Cancel", StringComparison.OrdinalIgnoreCase) ||
-                        label.Equals("Close", StringComparison.OrdinalIgnoreCase))
+                        label.Equals("Close", StringComparison.OrdinalIgnoreCase) ||
+                        button.DialogResult == DialogResult.Cancel ||
+                        (owner != null && object.ReferenceEquals(owner.CancelButton, button)))
                     {
                         PlayNamed(settings, "cancel");
                         return;
                     }
+                }
+
+                if (form is OptionsForm)
+                {
+                    // ComboBox/TextBox/NumericUpDown and other non-button Options controls
+                    // should not sound like a committed affirmative action when selected.
+                    PlayNamed(settings, "navigate");
+                    return;
                 }
 
                 PlayNamed(settings, "confirm");
@@ -6698,6 +8102,16 @@ namespace DolphinNetPlayLauncher
 
             if (action == ControllerAction.Cancel)
             {
+                // In ordinary Options navigation, B/East does not immediately close
+                // the dialog; it moves focus to Cancel and requires Accept to commit
+                // that cancellation. Use Navigate for that focus move, then let the
+                // OptionsForm closing boundary play the single Cancel cue.
+                if (form is OptionsForm)
+                {
+                    PlayNamed(settings, "navigate");
+                    return;
+                }
+
                 PlayNamed(settings, "cancel");
                 return;
             }
@@ -8224,6 +9638,7 @@ namespace DolphinNetPlayLauncher
 
             AppTheme.Apply(this, settings);
             AppFonts.Apply(this, settings);
+            UiSoundManager.AttachMouseInteractionSounds(this, settings);
         }
 
         private void ChooseAnother()
@@ -8340,6 +9755,7 @@ namespace DolphinNetPlayLauncher
 
             AppTheme.Apply(this, settings);
             AppFonts.Apply(this, settings);
+            UiSoundManager.AttachMouseInteractionSounds(this, settings);
         }
     }
 
@@ -8798,6 +10214,11 @@ namespace DolphinNetPlayLauncher
         public int Port;
         public bool InGame;
 
+        // Friend discovery is local-only metadata. It is never sent back to Dolphin's
+        // index and the decrypted target is never written to diagnostics.
+        public bool IsFriend;
+        public string FriendResolvedServerId = "";
+
         public override string ToString()
         {
             string title = string.IsNullOrWhiteSpace(Name) ? "(Unnamed session)" : Name;
@@ -8879,6 +10300,7 @@ namespace DolphinNetPlayLauncher
         private readonly List<PublicNetPlaySession> allSessions = new List<PublicNetPlaySession>();
         private readonly BackgroundWorker loader = new BackgroundWorker();
         private readonly bool embeddedMode;
+        private readonly SessionBannerCatalog bannerCatalog;
         private Font sessionBoldFont;
 
         public event EventHandler SessionChosen;
@@ -8886,15 +10308,22 @@ namespace DolphinNetPlayLauncher
 
         public PublicNetPlaySession SelectedSession { get; private set; }
         public string ResolvedServerId { get; private set; }
+        internal bool IsEmbeddedMode { get { return embeddedMode; } }
 
         public PublicSessionsForm(DnlSettings settings, string indexUrl, string localDolphinVersion)
-            : this(settings, indexUrl, localDolphinVersion, false)
+            : this(settings, indexUrl, localDolphinVersion, false, null)
         {
         }
 
         public PublicSessionsForm(DnlSettings settings, string indexUrl, string localDolphinVersion, bool embeddedMode)
+            : this(settings, indexUrl, localDolphinVersion, embeddedMode, null)
+        {
+        }
+
+        public PublicSessionsForm(DnlSettings settings, string indexUrl, string localDolphinVersion, bool embeddedMode, SessionBannerCatalog bannerCatalog)
         {
             this.embeddedMode = embeddedMode;
+            this.bannerCatalog = bannerCatalog;
             this.settings = settings;
             this.indexUrl = string.IsNullOrWhiteSpace(indexUrl)
                 ? "https://lobby.dolphin-emu.org"
@@ -8922,14 +10351,20 @@ namespace DolphinNetPlayLauncher
             }
 
             Label heading = new AdventureLabel();
-            heading.Text = "PUBLIC NETPLAY SESSIONS";
+            heading.Text = settings != null && settings.FriendGroupEnabled
+                ? "FRIENDS & PUBLIC SESSIONS"
+                : "PUBLIC NETPLAY SESSIONS";
             heading.Font = new Font("Segoe UI", 12.5F, FontStyle.Bold);
             heading.Location = new Point(18, 16);
             heading.AutoSize = true;
             sessionHost.Controls.Add(heading);
 
             Label source = new AdventureLabel();
-            source.Text = embeddedMode ? "Dolphin public lobby" : "Dolphin index: " + this.indexUrl;
+            source.Text = embeddedMode
+                ? (settings != null && settings.FriendGroupEnabled
+                    ? "Friend group: " + (string.IsNullOrWhiteSpace(settings.FriendGroupName) ? "Friends" : settings.FriendGroupName)
+                    : "Dolphin public lobby")
+                : "Dolphin index: " + this.indexUrl;
             source.Location = new Point(18, 39);
             source.Size = new Size(embeddedMode ? 260 : 520, 20);
             source.ForeColor = Color.DimGray;
@@ -9002,14 +10437,18 @@ namespace DolphinNetPlayLauncher
             detailMeta.ForeColor = Color.DimGray;
             details.Controls.Add(detailMeta);
 
-            statusLabel.Location = embeddedMode ? new Point(18, 624) : new Point(18, 574);
-            statusLabel.Size = new Size(embeddedMode ? 210 : 530, 25);
+            // Reserve a real two-line status area. Friend/version messages used
+            // to be squeezed into the narrow space left of the action buttons and were
+            // visibly clipped in the embedded Sessions panel.
+            statusLabel.Location = embeddedMode ? new Point(18, 613) : new Point(18, 565);
+            statusLabel.Size = new Size(embeddedMode ? 205 : 555, 48);
             statusLabel.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             statusLabel.ForeColor = Color.DimGray;
+            statusLabel.AutoSize = false;
             sessionHost.Controls.Add(statusLabel);
 
             joinButton.Text = "Use for Join";
-            joinButton.Location = embeddedMode ? new Point(236, 618) : new Point(595, 568);
+            joinButton.Location = embeddedMode ? new Point(236, 626) : new Point(595, 576);
             joinButton.Size = embeddedMode ? new Size(112, 32) : new Size(105, 32);
             joinButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             joinButton.Enabled = false;
@@ -9017,7 +10456,7 @@ namespace DolphinNetPlayLauncher
             sessionHost.Controls.Add(joinButton);
 
             closeButton.Text = embeddedMode ? "Hide" : "Close";
-            closeButton.Location = embeddedMode ? new Point(358, 618) : new Point(710, 568);
+            closeButton.Location = embeddedMode ? new Point(358, 626) : new Point(710, 576);
             closeButton.Size = embeddedMode ? new Size(90, 32) : new Size(87, 32);
             closeButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             if (!embeddedMode)
@@ -9071,11 +10510,16 @@ namespace DolphinNetPlayLauncher
             detailGame.Font = AppFonts.Create(settings, 9.75F, FontStyle.Regular);
             detailMeta.Font = AppFonts.Create(settings, 9.25F, FontStyle.Regular);
             statusLabel.Font = AppFonts.Create(settings, 9.25F, FontStyle.Regular);
-            sessionList.ItemHeight = 74;
+            sessionList.ItemHeight = BannerMode ? 86 : 74;
             sessionList.Invalidate();
 
             if (!embeddedMode)
                 ControllerNavigation.Attach(this, Program.ControllerManagerForChildForms, settings, null);
+        }
+
+        private bool BannerMode
+        {
+            get { return settings != null && string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase); }
         }
 
         public void FocusSessionsFromController()
@@ -9118,7 +10562,7 @@ namespace DolphinNetPlayLauncher
             // A global font/theme refresh can reach this embedded child form. Keep the
             // intended three-line public-session row geometry authoritative and refresh
             // the cached bold font only at this coarse boundary, never per row paint.
-            sessionList.ItemHeight = 74;
+            sessionList.ItemHeight = BannerMode ? 86 : 74;
             if (sessionBoldFont != null)
             {
                 try { sessionBoldFont.Dispose(); } catch { }
@@ -9141,7 +10585,11 @@ namespace DolphinNetPlayLauncher
 
         private void Loader_DoWork(object sender, DoWorkEventArgs e)
         {
-            e.Result = FetchSessions(indexUrl);
+            List<PublicNetPlaySession> loaded = FetchSessionsForDiscovery(indexUrl);
+            if (bannerCatalog != null && settings != null &&
+                string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase))
+                bannerCatalog.Preload(loaded);
+            e.Result = loaded;
         }
 
         private void Loader_Completed(object sender, RunWorkerCompletedEventArgs e)
@@ -9171,12 +10619,16 @@ namespace DolphinNetPlayLauncher
             if (loaded != null)
                 allSessions.AddRange(loaded);
 
+            int friendCount = ClassifyFriendSessions();
+            SortSessionsForDisplay();
+
             DiagnosticsLog.Write("SESSIONS", "Public session refresh completed: " +
-                allSessions.Count.ToString() + " sessions.");
+                allSessions.Count.ToString() + " sessions; " + friendCount.ToString() +
+                " configured friend session(s) recognized.");
             PopulateFiltered();
         }
 
-        private List<PublicNetPlaySession> FetchSessions(string baseUrl)
+        internal static List<PublicNetPlaySession> FetchSessionsForDiscovery(string baseUrl)
         {
             ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2 on .NET Framework 4.x
 
@@ -9261,6 +10713,152 @@ namespace DolphinNetPlayLauncher
             return result;
         }
 
+        private int ClassifyFriendSessions()
+        {
+            return ClassifyFriendSessionsForDiscovery(allSessions, settings);
+        }
+
+        internal static int ClassifyFriendSessionsForDiscovery(
+            List<PublicNetPlaySession> sessions, DnlSettings discoverySettings)
+        {
+            if (sessions == null)
+                return 0;
+
+            foreach (PublicNetPlaySession s in sessions)
+            {
+                s.IsFriend = false;
+                s.FriendResolvedServerId = "";
+            }
+
+            if (discoverySettings == null || !discoverySettings.FriendGroupEnabled ||
+                string.IsNullOrWhiteSpace(discoverySettings.FriendGroupPassword))
+                return 0;
+
+            HashSet<string> friendNames = ParseFriendNames(discoverySettings.FriendNames);
+            if (friendNames.Count == 0)
+                return 0;
+
+            int recognized = 0;
+            foreach (PublicNetPlaySession s in sessions)
+            {
+                if (s == null || !s.HasPassword ||
+                    string.IsNullOrWhiteSpace(s.Name) || !friendNames.Contains(s.Name.Trim()))
+                    continue;
+
+                string resolved;
+                if (!TryDecryptServerId(s.ServerId, discoverySettings.FriendGroupPassword, out resolved) ||
+                    !IsPlausibleResolvedTarget(s, resolved))
+                    continue;
+
+                s.IsFriend = true;
+                s.FriendResolvedServerId = resolved.Trim();
+                recognized++;
+            }
+            return recognized;
+        }
+
+        private static HashSet<string> ParseFriendNames(string raw)
+        {
+            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(raw))
+                return names;
+
+            string normalized = raw.Replace("\r", "\n");
+            foreach (string part in normalized.Split(new char[] { '\n', ',', ';' },
+                StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = Program.RemoveUnsafeIniCharacters(part).Trim();
+                if (name.Length > 0) names.Add(name);
+            }
+            return names;
+        }
+
+        private static bool IsPlausibleResolvedTarget(PublicNetPlaySession session, string resolved)
+        {
+            if (session == null || string.IsNullOrWhiteSpace(resolved) ||
+                Program.ContainsUnsafeIniCharacters(resolved))
+                return false;
+
+            string target = resolved.Trim();
+            if (string.Equals(session.Method, "traversal", StringComparison.OrdinalIgnoreCase))
+            {
+                // Dolphin traversal IDs are short room codes. Keep this deliberately
+                // strict enough that a wrong shared password cannot become a friend match
+                // merely because the checksum happened to collide.
+                return Regex.IsMatch(target, "^[A-Za-z0-9_-]{1,8}$");
+            }
+
+            if (string.Equals(session.Method, "direct", StringComparison.OrdinalIgnoreCase))
+            {
+                IPAddress ip;
+                if (IPAddress.TryParse(target, out ip))
+                    return true;
+                return Uri.CheckHostName(target) != UriHostNameType.Unknown && target.Length <= 255;
+            }
+
+            return false;
+        }
+
+        private void SortSessionsForDisplay()
+        {
+            SortSessionsForDiscovery(allSessions);
+        }
+
+        internal static void SortSessionsForDiscovery(List<PublicNetPlaySession> sessions)
+        {
+            if (sessions == null) return;
+            sessions.Sort(delegate(PublicNetPlaySession a, PublicNetPlaySession b)
+            {
+                if (a.IsFriend != b.IsFriend) return a.IsFriend ? -1 : 1;
+                if (a.InGame != b.InGame) return a.InGame ? 1 : -1;
+                int gameCompare = string.Compare(a.Game, b.Game, StringComparison.CurrentCultureIgnoreCase);
+                if (gameCompare != 0) return gameCompare;
+                return string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase);
+            });
+        }
+
+        private static string NormalizeDolphinVersionForComparison(string version)
+        {
+            if (string.IsNullOrWhiteSpace(version))
+                return "";
+
+            string normalized = version.Trim();
+
+            // Dolphin's local --version output is typically decorated as
+            // "Dolphin 2606-374", while the public NetPlay index publishes
+            // Common::GetScmDescStr(), which is the build description without
+            // the product-name prefix (for example "2606-374"). Treat those
+            // as the same build, but otherwise keep the descriptor intact so
+            // custom/suffixed builds are not accidentally collapsed together.
+            const string productPrefix = "Dolphin";
+            if (normalized.StartsWith(productPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                int prefixLength = productPrefix.Length;
+                if (normalized.Length == prefixLength || char.IsWhiteSpace(normalized[prefixLength]))
+                    normalized = normalized.Substring(prefixLength).TrimStart();
+            }
+
+            return normalized.Trim();
+        }
+
+        internal static bool DolphinVersionsMatch(string localVersion, string sessionVersion)
+        {
+            if (string.IsNullOrWhiteSpace(localVersion) || string.IsNullOrWhiteSpace(sessionVersion))
+                return false;
+
+            return string.Equals(
+                NormalizeDolphinVersionForComparison(localVersion),
+                NormalizeDolphinVersionForComparison(sessionVersion),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsVersionMismatch(PublicNetPlaySession s)
+        {
+            return s != null && !string.IsNullOrWhiteSpace(localDolphinVersion) &&
+                !string.IsNullOrWhiteSpace(s.Version) &&
+                !DolphinVersionsMatch(localDolphinVersion, s.Version);
+        }
+
         private static string GetString(Dictionary<string, object> d, string key)
         {
             object value;
@@ -9289,15 +10887,16 @@ namespace DolphinNetPlayLauncher
 
             foreach (PublicNetPlaySession s in allSessions)
             {
-                if (sameVersionCheck.Checked &&
+                if (sameVersionCheck.Checked && !s.IsFriend &&
                     !string.IsNullOrWhiteSpace(localDolphinVersion) &&
-                    !string.Equals(localDolphinVersion, s.Version, StringComparison.OrdinalIgnoreCase))
+                    !string.IsNullOrWhiteSpace(s.Version) &&
+                    !DolphinVersionsMatch(localDolphinVersion, s.Version))
                     continue;
 
                 if (!string.IsNullOrEmpty(q))
                 {
                     string haystack = (s.Name + "\n" + s.Game + "\n" + s.Region + "\n" +
-                        s.Version + "\n" + s.Method).ToLowerInvariant();
+                        s.Version + "\n" + s.Method + (s.IsFriend ? "\nfriend" : "")).ToLowerInvariant();
                     if (!haystack.Contains(q.ToLowerInvariant()))
                         continue;
                 }
@@ -9309,8 +10908,17 @@ namespace DolphinNetPlayLauncher
             if (sessionList.Items.Count > 0)
                 sessionList.SelectedIndex = 0;
 
-            statusLabel.Text = sessionList.Items.Count.ToString() +
-                (sessionList.Items.Count == 1 ? " session shown" : " sessions shown");
+            int visibleFriends = 0;
+            foreach (object item in sessionList.Items)
+            {
+                PublicNetPlaySession shown = item as PublicNetPlaySession;
+                if (shown != null && shown.IsFriend) visibleFriends++;
+            }
+            statusLabel.Text = visibleFriends > 0
+                ? visibleFriends.ToString() + (visibleFriends == 1 ? " friend online • " : " friends online • ") +
+                    sessionList.Items.Count.ToString() + " shown"
+                : sessionList.Items.Count.ToString() +
+                    (sessionList.Items.Count == 1 ? " session shown" : " sessions shown");
             UpdateDetails();
         }
 
@@ -9330,9 +10938,6 @@ namespace DolphinNetPlayLauncher
 
             if (selected && AccentVisuals.Animated(settings))
             {
-                // Match the Games list controller cursor. Native owner-drawn ListBoxes
-                // flicker if continuously animated, so use the launcher's animated
-                // gradient as a stable snapshot whenever this row naturally redraws.
                 using (LinearGradientBrush b = AccentVisuals.CreateGradient(e.Bounds, 255))
                     e.Graphics.FillRectangle(b, e.Bounds);
                 fore = Color.White;
@@ -9344,16 +10949,44 @@ namespace DolphinNetPlayLauncher
                     e.Graphics.FillRectangle(b, e.Bounds);
             }
 
-            Rectangle titleRect = new Rectangle(e.Bounds.X + 10, e.Bounds.Y + 6, e.Bounds.Width - 20, 22);
-            Rectangle gameRect = new Rectangle(e.Bounds.X + 10, e.Bounds.Y + 29, e.Bounds.Width - 20, 20);
-            Rectangle metaRect = new Rectangle(e.Bounds.X + 10, e.Bounds.Y + 51, e.Bounds.Width - 20, 18);
+            int textLeft = e.Bounds.X + 10;
+            Image banner = BannerMode && bannerCatalog != null ? bannerCatalog.GetCached(s.Game) : null;
+            if (banner != null)
+            {
+                Rectangle bannerRect = new Rectangle(e.Bounds.X + 10, e.Bounds.Y + 24, 108, 36);
+                e.Graphics.DrawImage(banner, bannerRect);
+                using (Pen bp = new Pen(Color.FromArgb(110, AppTheme.Border(settings))))
+                    e.Graphics.DrawRectangle(bp, bannerRect.X, bannerRect.Y, bannerRect.Width - 1, bannerRect.Height - 1);
+                textLeft = bannerRect.Right + 12;
+            }
+
+            int rightPad = 10;
+            int textWidth = Math.Max(40, e.Bounds.Right - textLeft - rightPad);
+            Rectangle titleRect = BannerMode
+                ? new Rectangle(textLeft, e.Bounds.Y + 5, textWidth, 19)
+                : new Rectangle(textLeft, e.Bounds.Y + 6, textWidth, 22);
+            Rectangle gameRect = BannerMode
+                ? new Rectangle(textLeft, e.Bounds.Y + 25, textWidth, 18)
+                : new Rectangle(textLeft, e.Bounds.Y + 29, textWidth, 20);
+            Rectangle metaRect = BannerMode
+                ? new Rectangle(textLeft, e.Bounds.Y + 44, textWidth, 17)
+                : new Rectangle(textLeft, e.Bounds.Y + 51, textWidth, 18);
+            Rectangle stateRect = new Rectangle(textLeft, e.Bounds.Y + 62, textWidth, 17);
 
             string title = string.IsNullOrWhiteSpace(s.Name) ? "(Unnamed session)" : s.Name;
-            string game = string.IsNullOrWhiteSpace(s.Game) ? "Unknown game" : s.Game;
-            string meta = RegionName(s.Region) + " • " + s.PlayerCount.ToString() +
-                (s.PlayerCount == 1 ? " player" : " players") + " • " +
+            if (s.IsFriend) title = "★ " + title;
+            SessionGamePresentation gameInfo = BannerMode ? SessionBannerCatalog.ParseGame(s.Game) : null;
+            string game = BannerMode
+                ? (gameInfo == null || string.IsNullOrWhiteSpace(gameInfo.Title) ? "Unknown game" : gameInfo.Title)
+                : (string.IsNullOrWhiteSpace(s.Game) ? "Unknown game" : s.Game);
+            string idMeta = BannerMode && gameInfo != null ? gameInfo.MetadataText : "";
+            string meta = (string.IsNullOrWhiteSpace(idMeta) ? "" : idMeta + " • ") +
+                (s.IsFriend ? "Friend • " : "") + RegionName(s.Region);
+            string stateMeta = s.PlayerCount.ToString() + (s.PlayerCount == 1 ? " player" : " players") + " • " +
                 (s.InGame ? "In Game" : "Waiting") +
                 (s.HasPassword ? " • Password" : "");
+            if (!BannerMode)
+                meta = (s.IsFriend ? "Friend • " : "") + RegionName(s.Region) + " • " + stateMeta;
 
             Font bold = sessionBoldFont ?? sessionList.Font;
             TextRenderer.DrawText(e.Graphics, title, bold, titleRect, fore,
@@ -9362,6 +10995,13 @@ namespace DolphinNetPlayLauncher
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             TextRenderer.DrawText(e.Graphics, meta, sessionList.Font, metaRect, dim,
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            if (BannerMode)
+            {
+                TextRenderer.DrawText(e.Graphics, stateMeta, sessionList.Font, stateRect, dim,
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+            // Plain mode keeps the established three-line density; its player/state
+            // information is already folded into the meta line above.
 
             using (Pen p = new Pen(AppTheme.Border(settings)))
                 e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
@@ -9372,7 +11012,8 @@ namespace DolphinNetPlayLauncher
         private void UpdateDetails()
         {
             PublicNetPlaySession s = sessionList.SelectedItem as PublicNetPlaySession;
-            joinButton.Enabled = s != null;
+            joinButton.Enabled = s != null &&
+                (!s.IsFriend || (!s.InGame && !IsVersionMismatch(s)));
             if (s == null)
             {
                 detailName.Text = "";
@@ -9381,22 +11022,34 @@ namespace DolphinNetPlayLauncher
                 return;
             }
 
-            detailName.Text = string.IsNullOrWhiteSpace(s.Name) ? "(Unnamed session)" : s.Name;
-            detailGame.Text = string.IsNullOrWhiteSpace(s.Game) ? "Unknown game" : s.Game;
+            detailName.Text = (s.IsFriend ? "★ Friend • " : "") +
+                (string.IsNullOrWhiteSpace(s.Name) ? "(Unnamed session)" : s.Name);
+            SessionGamePresentation detailGameInfo = BannerMode ? SessionBannerCatalog.ParseGame(s.Game) : null;
+            detailGame.Text = BannerMode
+                ? (detailGameInfo == null || string.IsNullOrWhiteSpace(detailGameInfo.Title) ? "Unknown game" : detailGameInfo.Title)
+                : (string.IsNullOrWhiteSpace(s.Game) ? "Unknown game" : s.Game);
 
             string versionNote = s.Version;
             if (!string.IsNullOrWhiteSpace(localDolphinVersion) &&
                 !string.IsNullOrWhiteSpace(s.Version) &&
-                !string.Equals(localDolphinVersion, s.Version, StringComparison.OrdinalIgnoreCase))
+                !DolphinVersionsMatch(localDolphinVersion, s.Version))
             {
                 versionNote += "  •  Your Dolphin: " + localDolphinVersion;
             }
 
-            detailMeta.Text = RegionName(s.Region) + " • " +
+            string friendState = "";
+            if (s.IsFriend && s.InGame) friendState = " • Already in game";
+            else if (s.IsFriend && IsVersionMismatch(s)) friendState = " • Dolphin version mismatch";
+            else if (s.IsFriend) friendState = " • Shared password matched";
+
+            string detailIdMeta = BannerMode && detailGameInfo != null ? detailGameInfo.MetadataText : "";
+            detailMeta.Text = (string.IsNullOrWhiteSpace(detailIdMeta) ? "" : detailIdMeta + " • ") +
+                RegionName(s.Region) + " • " +
                 (string.Equals(s.Method, "traversal", StringComparison.OrdinalIgnoreCase) ? "Traversal" : "Direct") +
                 " • " + s.PlayerCount.ToString() + (s.PlayerCount == 1 ? " player" : " players") +
                 " • " + (s.InGame ? "In Game" : "Waiting") +
-                (s.HasPassword ? " • Password required" : "") +
+                (s.HasPassword ? (s.IsFriend ? " • Friend password" : " • Password required") : "") +
+                friendState +
                 (string.IsNullOrWhiteSpace(versionNote) ? "" : " • " + versionNote);
         }
 
@@ -9406,8 +11059,25 @@ namespace DolphinNetPlayLauncher
             if (s == null)
                 return;
 
+            if (s.IsFriend && s.InGame)
+            {
+                statusLabel.Text = "Friend is already in game; wait for the lobby to reopen.";
+                return;
+            }
+            if (s.IsFriend && IsVersionMismatch(s))
+            {
+                statusLabel.Text = "Friend found, but the Dolphin versions do not match.";
+                return;
+            }
+
             string resolved = s.ServerId;
-            if (s.HasPassword)
+            if (s.IsFriend && !string.IsNullOrWhiteSpace(s.FriendResolvedServerId))
+            {
+                resolved = s.FriendResolvedServerId;
+                DiagnosticsLog.Write("SESSIONS",
+                    "Configured friend session selected; shared group password resolved target locally (target redacted).");
+            }
+            else if (s.HasPassword)
             {
                 using (NetPlayPasswordForm passwordForm = new NetPlayPasswordForm(settings, s.Name))
                 {
@@ -9670,6 +11340,7 @@ namespace DolphinNetPlayLauncher
     {
         private readonly RadioButton hostRadio = new AdventureRadioButton();
         private readonly RadioButton joinRadio = new AdventureRadioButton();
+        private readonly RadioButton friendRadio = new AdventureRadioButton();
         private readonly RadioButton traversalRadio = new AdventureRadioButton();
         private readonly RadioButton directRadio = new AdventureRadioButton();
         private readonly SelectorPanel modeSelectorPanel = new SelectorPanel();
@@ -9694,6 +11365,7 @@ namespace DolphinNetPlayLauncher
         private readonly AnimatedThemePanel mainPanel = new AnimatedThemePanel();
         private readonly AnimatedThemePanel libraryPanel = new AnimatedThemePanel();
         private readonly AnimatedThemePanel sessionsPanel = new AnimatedThemePanel();
+        private readonly AdventureGroupBox dolphinGroup = new AdventureGroupBox();
         private PublicSessionsForm embeddedSessionsBrowser;
         private bool sessionsVisible;
         private bool sidePanelSwapInProgress;
@@ -9708,7 +11380,36 @@ namespace DolphinNetPlayLauncher
         }
 
         private readonly CheckBox publicHostCheck = new CheckBox();
+        private readonly CheckBox friendHostCheck = new CheckBox();
         private readonly AdventureGroupBox publicHostGroup = new AdventureGroupBox();
+        private readonly AdventureGroupBox friendJoinGroup = new AdventureGroupBox();
+        private readonly ListBox friendJoinList = new ListBox();
+        private readonly ComboBox friendGroupSelectorBox = new ThemedComboBox();
+        private readonly ComboBox friendHostGroupSelectorBox = new ThemedComboBox();
+        private readonly Button friendRefreshButton = new AdventureButton();
+        private readonly Button friendRouteButton = new AdventureButton();
+        private readonly Button friendGroupManageButton = new AdventureButton();
+        private readonly Button friendHostManageButton = new AdventureButton();
+        private readonly Label friendJoinStatusLabel = new AdventureLabel();
+        private readonly BackgroundWorker friendLoader = new BackgroundWorker();
+        private readonly System.Windows.Forms.Timer friendRefreshTimer = new System.Windows.Forms.Timer();
+        private readonly List<PublicNetPlaySession> friendDiscoverySessions = new List<PublicNetPlaySession>();
+        private PublicNetPlaySession selectedFriendSession;
+        private string loadedFriendName = "";
+        private string loadedFriendLanAddress = "";
+        private int loadedFriendLanPort = 0;
+        private bool loadedFriendUseLan;
+        private bool friendOptionsRequested;
+        private bool friendRefreshPending;
+        private bool friendGroupSelectorUpdating;
+        private bool lastMainModeWasJoin;
+        private Font friendRosterBoldFont;
+        private Font friendRosterBadgeFont;
+        private readonly Dictionary<string, Image> friendCustomBadgeImages =
+            new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
+        private string friendLanOverrideCacheRaw = null;
+        private Dictionary<string, FriendLanEndpoint> friendLanOverrideCache =
+            new Dictionary<string, FriendLanEndpoint>(StringComparer.OrdinalIgnoreCase);
         private readonly TextBox publicSessionNameBox = new TextBox();
         private readonly ThemedComboBox publicRegionBox = new ThemedComboBox();
         private readonly TextBox publicPasswordBox = new TextBox();
@@ -9758,6 +11459,7 @@ namespace DolphinNetPlayLauncher
         private readonly Button librarySetupButton = new AdventureButton();
         private readonly DolphinPaths dolphinPaths;
         private readonly DnlSettings settings;
+        private readonly SessionBannerCatalog sessionBannerCatalog;
         private readonly string dolphinVersion;
         private readonly Dictionary<string, GameInfo> libraryInfoCache =
             new Dictionary<string, GameInfo>(StringComparer.OrdinalIgnoreCase);
@@ -9780,10 +11482,49 @@ namespace DolphinNetPlayLauncher
         public event EventHandler OptionsRequested;
 
         public LaunchMode Mode { get { return joinRadio.Checked ? LaunchMode.Join : LaunchMode.Host; } }
-        public JoinConnection JoinType { get { return directRadio.Checked ? JoinConnection.Direct : JoinConnection.Traversal; } }
+        public JoinConnection JoinType
+        {
+            get
+            {
+                if (friendRadio.Checked && selectedFriendSession != null)
+                {
+                    if (loadedFriendUseLan && !string.IsNullOrWhiteSpace(loadedFriendLanAddress))
+                        return JoinConnection.Direct;
+                    if (string.Equals(selectedFriendSession.Method, "direct", StringComparison.OrdinalIgnoreCase))
+                        return JoinConnection.Direct;
+                }
+                return directRadio.Checked ? JoinConnection.Direct : JoinConnection.Traversal;
+            }
+        }
         public string Nickname { get { return nickBox.Text; } }
-        public string Target { get { return targetBox.Text; } }
-        public int Port { get { return (int)portBox.Value; } }
+        public string Target
+        {
+            get
+            {
+                if (friendRadio.Checked && selectedFriendSession != null)
+                {
+                    if (loadedFriendUseLan && !string.IsNullOrWhiteSpace(loadedFriendLanAddress))
+                        return loadedFriendLanAddress;
+                    return selectedFriendSession.FriendResolvedServerId ?? "";
+                }
+                return targetBox.Text;
+            }
+        }
+        public int Port
+        {
+            get
+            {
+                if (friendRadio.Checked && selectedFriendSession != null)
+                {
+                    if (loadedFriendUseLan && !string.IsNullOrWhiteSpace(loadedFriendLanAddress) &&
+                        loadedFriendLanPort >= 1 && loadedFriendLanPort <= 65535)
+                        return loadedFriendLanPort;
+                    if (selectedFriendSession.Port >= 1 && selectedFriendSession.Port <= 65535)
+                        return selectedFriendSession.Port;
+                }
+                return (int)portBox.Value;
+            }
+        }
         public string SelectedGamePath { get { return selectedGamePath; } }
         public bool ShowInServerBrowser { get { return publicHostCheck.Checked; } }
         public string PublicSessionName { get { return publicSessionNameBox.Text.Trim(); } }
@@ -9813,6 +11554,7 @@ namespace DolphinNetPlayLauncher
             this.dolphinPaths = dolphinPaths;
             this.settings = settings;
             this.dolphinVersion = version ?? "";
+            sessionBannerCatalog = new SessionBannerCatalog(dolphinPaths, allGames);
             UiSoundManager.Configure(settings);
             selectedGamePath = initialGamePath;
             libraryGridView = settings == null || !string.Equals(settings.LibraryView, "List", StringComparison.OrdinalIgnoreCase);
@@ -9820,6 +11562,18 @@ namespace DolphinNetPlayLauncher
             libraryGridColumns = settings != null ? Math.Max(3, Math.Min(5, settings.LibraryGridColumns)) : 3;
 
             Text = Program.AppDisplayName;
+            // Build.bat embeds Assets\Icons\DolphinNetPlayLauncher.ico in the EXE. WinForms does not
+            // reliably promote that executable icon to a Form automatically, so load the
+            // embedded application icon explicitly for the launcher title bar/taskbar.
+            try
+            {
+                using (System.Drawing.Icon appIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath))
+                {
+                    if (appIcon != null) Icon = (System.Drawing.Icon)appIcon.Clone();
+                }
+            }
+            catch { }
+
             // Composite the launcher form into a back buffer before presenting it.
             // This reduces exposed rectangular child-control backgrounds while the
             // right-side Games/Sessions surface is being replaced.
@@ -9874,7 +11628,7 @@ namespace DolphinNetPlayLauncher
 
             Panel header = new Panel();
             header.Location = new Point(0, 0);
-            header.Size = new Size(580, 142);
+            header.Size = new Size(580, 122);
             header.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             // One shallow transparent structural layer is cheap enough and removes the
             // old giant header slab. Avoid nested transparent controls: e4 proved that
@@ -9883,7 +11637,7 @@ namespace DolphinNetPlayLauncher
             mainPanel.Controls.Add(header);
 
             launcherLogo.Location = new Point(16, 12);
-            launcherLogo.Size = new Size(70, 70);
+            launcherLogo.Size = new Size(60, 60);
             launcherLogo.ImageInset = 2;
             launcherLogo.CornerRadius = 11F;
             ApplyThemeLogo();
@@ -9893,11 +11647,11 @@ namespace DolphinNetPlayLauncher
             title.Text = "Dolphin NetPlay";
             title.Font = new Font("Segoe UI", 17F, FontStyle.Bold);
             title.AutoSize = true;
-            title.Location = new Point(98, 12);
+            title.Location = new Point(88, 10);
             header.Controls.Add(title);
 
-            gameBanner.Location = new Point(100, 42);
-            gameBanner.Size = new Size(126, 42);
+            gameBanner.Location = new Point(88, 38);
+            gameBanner.Size = new Size(108, 36);
             gameBanner.SizeMode = PictureBoxSizeMode.Zoom;
             gameBanner.BackColor = Color.FromArgb(238, 241, 245);
             gameBanner.Visible = false;
@@ -9909,23 +11663,23 @@ namespace DolphinNetPlayLauncher
             gameLabel.Text = gameName;
             gameLabel.Font = new Font("Segoe UI", 10.5F, FontStyle.Bold);
             gameLabel.AutoEllipsis = true;
-            gameLabel.Location = new Point(100, 88);
-            gameLabel.Size = new Size(228, 22);
+            gameLabel.Location = new Point(88, 78);
+            gameLabel.Size = new Size(240, 21);
             gameLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             header.Controls.Add(gameLabel);
 
             gameMetaLabel.Text = BuildMeta(gameId, revision);
             gameMetaLabel.ForeColor = Color.DimGray;
             gameMetaLabel.AutoSize = false;
-            gameMetaLabel.Location = new Point(100, 110);
-            gameMetaLabel.Size = new Size(228, 18);
+            gameMetaLabel.Location = new Point(88, 100);
+            gameMetaLabel.Size = new Size(240, 17);
             gameMetaLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             header.Controls.Add(gameMetaLabel);
 
             UpdateSelectedGameBanner();
 
             clearGameButton.Text = "Clear";
-            clearGameButton.Location = new Point(340, 50);
+            clearGameButton.Location = new Point(340, 42);
             clearGameButton.Size = new Size(55, 30);
             clearGameButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             clearGameButton.Enabled = !string.IsNullOrWhiteSpace(selectedGamePath);
@@ -9933,21 +11687,21 @@ namespace DolphinNetPlayLauncher
             header.Controls.Add(clearGameButton);
 
             gamesButton.Text = "Games...";
-            gamesButton.Location = new Point(401, 50);
+            gamesButton.Location = new Point(401, 42);
             gamesButton.Size = new Size(72, 30);
             gamesButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             gamesButton.Click += delegate { ToggleLibrary(); };
             header.Controls.Add(gamesButton);
 
             sessionsButton.Text = "Sessions...";
-            sessionsButton.Location = new Point(479, 50);
+            sessionsButton.Location = new Point(479, 42);
             sessionsButton.Size = new Size(89, 30);
             sessionsButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             sessionsButton.Click += delegate { ToggleSessionsPanel(); };
             header.Controls.Add(sessionsButton);
 
             joinGameInfoIcon.Text = "!";
-            joinGameInfoIcon.Location = new Point(540, 84);
+            joinGameInfoIcon.Location = new Point(540, 76);
             joinGameInfoIcon.Size = new Size(28, 28);
             joinGameInfoIcon.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             joinGameInfoIcon.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
@@ -10011,11 +11765,11 @@ namespace DolphinNetPlayLauncher
             modeHeading.Text = "MODE";
             modeHeading.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
             modeHeading.ForeColor = Color.FromArgb(95, 100, 110);
-            modeHeading.Location = new Point(24, 157);
+            modeHeading.Location = new Point(24, 136);
             modeHeading.AutoSize = true;
             mainPanel.Controls.Add(modeHeading);
 
-            modeSelectorPanel.Location = new Point(20, 178);
+            modeSelectorPanel.Location = new Point(20, 157);
             modeSelectorPanel.Size = new Size(540, 48);
             modeSelectorPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             mainPanel.Controls.Add(modeSelectorPanel);
@@ -10048,10 +11802,10 @@ namespace DolphinNetPlayLauncher
             nickLabel.Font = new Font("Segoe UI", 8.5F, FontStyle.Bold);
             nickLabel.ForeColor = Color.FromArgb(80, 85, 95);
             nickLabel.AutoSize = true;
-            nickLabel.Location = new Point(24, 247);
+            nickLabel.Location = new Point(24, 226);
             mainPanel.Controls.Add(nickLabel);
 
-            nickBox.Location = new Point(125, 243);
+            nickBox.Location = new Point(125, 222);
             nickBox.Size = new Size(390, 26);
             nickBox.Text = Program.RemoveUnsafeIniCharacters(nickname);
             nickBox.TextChanged += delegate { EnforceIniSafeText(nickBox); };
@@ -10064,14 +11818,29 @@ namespace DolphinNetPlayLauncher
             connectionHeading.Text = "CONNECTION";
             connectionHeading.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
             connectionHeading.ForeColor = Color.FromArgb(95, 100, 110);
-            connectionHeading.Location = new Point(24, 281);
+            connectionHeading.Location = new Point(24, 260);
             connectionHeading.AutoSize = true;
             mainPanel.Controls.Add(connectionHeading);
 
-            connectionSelectorPanel.Location = new Point(20, 302);
+            connectionSelectorPanel.Location = new Point(20, 281);
             connectionSelectorPanel.Size = new Size(540, 48);
             connectionSelectorPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             mainPanel.Controls.Add(connectionSelectorPanel);
+
+            friendRadio.Text = "Friends";
+            friendRadio.Appearance = System.Windows.Forms.Appearance.Button;
+            friendRadio.TextAlign = ContentAlignment.MiddleCenter;
+            friendRadio.FlatStyle = FlatStyle.Flat;
+            friendRadio.FlatAppearance.BorderSize = 0;
+            friendRadio.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+            // Friends is the primary 0.12 Join workflow, so when it is
+            // available keep it visually centered between the two lower-level routes.
+            // The selector reads Traversal | Friends | Direct IP.
+            friendRadio.Location = new Point(184, 6);
+            friendRadio.Size = new Size(170, 36);
+            friendRadio.Visible = settings != null && settings.FriendGroupEnabled;
+            friendRadio.TabIndex = 1;
+            connectionSelectorPanel.Controls.Add(friendRadio);
 
             traversalRadio.Text = "Traversal";
             traversalRadio.Appearance = System.Windows.Forms.Appearance.Button;
@@ -10080,7 +11849,8 @@ namespace DolphinNetPlayLauncher
             traversalRadio.FlatAppearance.BorderSize = 0;
             traversalRadio.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
             traversalRadio.Location = new Point(6, 6);
-            traversalRadio.Size = new Size(260, 36);
+            traversalRadio.Size = friendRadio.Visible ? new Size(170, 36) : new Size(260, 36);
+            traversalRadio.TabIndex = 0;
             connectionSelectorPanel.Controls.Add(traversalRadio);
 
             directRadio.Text = "Direct IP";
@@ -10089,21 +11859,54 @@ namespace DolphinNetPlayLauncher
             directRadio.FlatStyle = FlatStyle.Flat;
             directRadio.FlatAppearance.BorderSize = 0;
             directRadio.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
-            directRadio.Location = new Point(274, 6);
-            directRadio.Size = new Size(260, 36);
-            directRadio.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            directRadio.Location = friendRadio.Visible ? new Point(362, 6) : new Point(274, 6);
+            directRadio.Size = friendRadio.Visible ? new Size(172, 36) : new Size(260, 36);
+            directRadio.Anchor = friendRadio.Visible ? AnchorStyles.Top | AnchorStyles.Right : AnchorStyles.Top | AnchorStyles.Right;
+            directRadio.TabIndex = friendRadio.Visible ? 2 : 1;
             connectionSelectorPanel.Controls.Add(directRadio);
 
             publicHostGroup.RaisedSection = true;
             publicHostGroup.Text = "PUBLIC HOSTING";
             publicHostGroup.Location = new Point(20, 280);
-            publicHostGroup.Size = new Size(540, 154);
+            publicHostGroup.Size = new Size(540, 180);
             publicHostGroup.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             mainPanel.Controls.Add(publicHostGroup);
 
+            friendHostCheck.Text = "Use friend group";
+            friendHostCheck.AutoSize = true;
+            friendHostCheck.Location = new Point(14, 23);
+            friendHostCheck.Visible = settings != null && settings.FriendGroupEnabled;
+            friendHostCheck.CheckedChanged += delegate
+            {
+                if (friendHostCheck.Checked) ApplyFriendGroupHostValues();
+                UpdatePublicHostUi();
+                UpdateGameState();
+            };
+            publicHostGroup.Controls.Add(friendHostCheck);
+
+            // Host mirrors Join's active Friend Group selector. Switching here
+            // changes the single active-group projection used by both workflows.
+            friendHostGroupSelectorBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendHostGroupSelectorBox.Location = new Point(145, 17);
+            friendHostGroupSelectorBox.Size = new Size(190, 28);
+            friendHostGroupSelectorBox.DropDownClosed += delegate
+            {
+                if (!friendGroupSelectorUpdating) ActivateFriendGroupFromHostSelection();
+            };
+            publicHostGroup.Controls.Add(friendHostGroupSelectorBox);
+            EnableSoftRoundedEntry(friendHostGroupSelectorBox);
+
+            friendHostManageButton.Text = "Group...";
+            friendHostManageButton.Location = new Point(438, 17);
+            friendHostManageButton.Size = new Size(87, 28);
+            friendHostManageButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            friendHostManageButton.Visible = settings != null && settings.FriendGroupEnabled;
+            friendHostManageButton.Click += delegate { OpenFriendOptions(); };
+            publicHostGroup.Controls.Add(friendHostManageButton);
+
             publicHostCheck.Text = "Show in Server Browser";
             publicHostCheck.AutoSize = true;
-            publicHostCheck.Location = new Point(14, 23);
+            publicHostCheck.Location = new Point(14, 51);
             // Let the label portion sit on the raised PUBLIC HOSTING card instead
             // of looking like a separate dark badge. This is a tiny native child
             // transparency only; no launcher/background rendering path is changed.
@@ -10117,11 +11920,11 @@ namespace DolphinNetPlayLauncher
 
             Label publicNameLabel = new AdventureLabel();
             publicNameLabel.Text = "Session Name";
-            publicNameLabel.Location = new Point(14, 58);
+            publicNameLabel.Location = new Point(14, 86);
             publicNameLabel.AutoSize = true;
             publicHostGroup.Controls.Add(publicNameLabel);
 
-            publicSessionNameBox.Location = new Point(112, 54);
+            publicSessionNameBox.Location = new Point(112, 82);
             publicSessionNameBox.Size = new Size(205, 24);
             publicSessionNameBox.Text = "";
             publicSessionNameBox.TextChanged += delegate { EnforceIniSafeText(publicSessionNameBox); UpdateGameState(); };
@@ -10129,11 +11932,11 @@ namespace DolphinNetPlayLauncher
 
             Label publicRegionLabel = new AdventureLabel();
             publicRegionLabel.Text = "Region";
-            publicRegionLabel.Location = new Point(330, 58);
+            publicRegionLabel.Location = new Point(330, 86);
             publicRegionLabel.AutoSize = true;
             publicHostGroup.Controls.Add(publicRegionLabel);
 
-            publicRegionBox.Location = new Point(385, 54);
+            publicRegionBox.Location = new Point(385, 82);
             publicRegionBox.Size = new Size(140, 26);
             publicRegionBox.DropDownStyle = ComboBoxStyle.DropDownList;
             publicRegionBox.Items.AddRange(new object[]
@@ -10156,11 +11959,11 @@ namespace DolphinNetPlayLauncher
 
             Label publicPasswordLabel = new AdventureLabel();
             publicPasswordLabel.Text = "Password";
-            publicPasswordLabel.Location = new Point(14, 96);
+            publicPasswordLabel.Location = new Point(14, 124);
             publicPasswordLabel.AutoSize = true;
             publicHostGroup.Controls.Add(publicPasswordLabel);
 
-            publicPasswordBox.Location = new Point(112, 92);
+            publicPasswordBox.Location = new Point(112, 120);
             publicPasswordBox.Size = new Size(205, 24);
             publicPasswordBox.UseSystemPasswordChar = true;
             publicPasswordBox.Text = "";
@@ -10169,16 +11972,16 @@ namespace DolphinNetPlayLauncher
 
             Label publicPasswordHint = new AdventureLabel();
             publicPasswordHint.Text = "Optional • stored by Dolphin";
-            publicPasswordHint.Location = new Point(330, 96);
+            publicPasswordHint.Location = new Point(330, 124);
             publicPasswordHint.Size = new Size(195, 20);
             publicPasswordHint.ForeColor = Color.DimGray;
             publicHostGroup.Controls.Add(publicPasswordHint);
 
-            targetLabel.Location = new Point(24, 372);
+            targetLabel.Location = new Point(24, 351);
             targetLabel.AutoSize = true;
             mainPanel.Controls.Add(targetLabel);
 
-            targetBox.Location = new Point(125, 368);
+            targetBox.Location = new Point(125, 347);
             targetBox.Size = new Size(245, 24);
             targetBox.Font = new Font("Consolas", 10F);
             mainPanel.Controls.Add(targetBox);
@@ -10196,7 +11999,7 @@ namespace DolphinNetPlayLauncher
 
             pasteButton.Text = "Paste";
             pasteButton.FlatStyle = FlatStyle.System;
-            pasteButton.Location = new Point(380, 367);
+            pasteButton.Location = new Point(380, 346);
             pasteButton.Size = new Size(75, 27);
             pasteButton.Click += delegate
             {
@@ -10218,11 +12021,11 @@ namespace DolphinNetPlayLauncher
             mainPanel.Controls.Add(pasteButton);
 
             portLabel.Text = "Port:";
-            portLabel.Location = new Point(24, 414);
+            portLabel.Location = new Point(24, 393);
             portLabel.AutoSize = true;
             mainPanel.Controls.Add(portLabel);
 
-            portBox.Location = new Point(125, 410);
+            portBox.Location = new Point(125, 389);
             portBox.Size = new Size(95, 24);
             portBox.Minimum = 1;
             portBox.Maximum = 65535;
@@ -10236,20 +12039,118 @@ namespace DolphinNetPlayLauncher
             EnableSoftRoundedEntry(publicPasswordBox);
             EnableSoftRoundedEntry(gameSearch);
 
-            AdventureGroupBox dolphin = new AdventureGroupBox();
-            dolphin.RaisedSection = true;
-            dolphin.Text = "Dolphin";
-            dolphin.Location = new Point(20, 456);
-            dolphin.Size = new Size(540, 94);
-            dolphin.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
-            mainPanel.Controls.Add(dolphin);
+            // Friends is a first-class Join connection mode. Keep the full
+            // public Sessions browser available separately, but surface configured
+            // friends directly on the main launcher so normal friend-group play never
+            // needs to open Sessions or exchange a room code.
+            friendJoinGroup.RaisedSection = true;
+            friendJoinGroup.Text = "FRIENDS";
+            friendJoinGroup.Location = new Point(20, 331);
+            friendJoinGroup.Size = new Size(540, 114);
+            friendJoinGroup.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            friendJoinGroup.Visible = false;
+            mainPanel.Controls.Add(friendJoinGroup);
+
+            // The old Show offline checkbox was removed. That top-row space now
+            // carries the active Friend Group selector, making group switching a normal
+            // main-window action rather than an Options-only operation.
+            friendGroupSelectorBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendGroupSelectorBox.Location = new Point(14, 16);
+            friendGroupSelectorBox.Size = new Size(164, 28);
+            // Commit group switching when the dropdown closes. This lets controller
+            // Up/Down preview entries inside an open ComboBox without refreshing/rebuilding
+            // the Friends UI on every intermediate row. Mouse selection closes the list
+            // and follows the same commit path.
+            friendGroupSelectorBox.DropDownClosed += delegate
+            {
+                if (!friendGroupSelectorUpdating) ActivateFriendGroupFromMainSelection();
+            };
+            friendJoinGroup.Controls.Add(friendGroupSelectorBox);
+            EnableSoftRoundedEntry(friendGroupSelectorBox);
+
+            friendJoinStatusLabel.Location = new Point(186, 22);
+            friendJoinStatusLabel.Size = new Size(150, 20);
+            friendJoinStatusLabel.ForeColor = Color.DimGray;
+            friendJoinStatusLabel.AutoEllipsis = true;
+            friendJoinGroup.Controls.Add(friendJoinStatusLabel);
+
+            // A saved LAN endpoint is a default, not a permanent lock.
+            // This button occupies the same top-row slot as the status summary only
+            // while a loaded Friend actually has a LAN override configured.
+            friendRouteButton.Location = new Point(186, 16);
+            friendRouteButton.Size = new Size(150, 28);
+            friendRouteButton.Visible = false;
+            // Route choice is a neutral Friends-navigation toggle, not a commit.
+            // Tag it so generic mouse/controller sound routing uses the same cue as Refresh.
+            friendRouteButton.Tag = "SoundNavigate";
+            friendRouteButton.Click += delegate { ToggleLoadedFriendRoute(); };
+            friendJoinGroup.Controls.Add(friendRouteButton);
+
+            friendGroupManageButton.Text = "Group...";
+            friendGroupManageButton.Location = new Point(344, 16);
+            friendGroupManageButton.Size = new Size(86, 28);
+            friendGroupManageButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            friendGroupManageButton.Click += delegate { OpenFriendOptions(); };
+            friendJoinGroup.Controls.Add(friendGroupManageButton);
+
+            friendRefreshButton.Text = "Refresh";
+            friendRefreshButton.Location = new Point(438, 16);
+            friendRefreshButton.Size = new Size(87, 28);
+            friendRefreshButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            friendRefreshButton.Click += delegate { BeginFriendRefresh(true); };
+            friendJoinGroup.Controls.Add(friendRefreshButton);
+
+            friendJoinList.Location = new Point(14, 49);
+            friendJoinList.Size = new Size(511, 56);
+            friendJoinList.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            friendJoinList.DrawMode = DrawMode.OwnerDrawFixed;
+            friendJoinList.ItemHeight = 26;
+            friendJoinList.IntegralHeight = false;
+            friendJoinList.DrawItem += DrawFriendJoinItem;
+            friendJoinList.SelectedIndexChanged += delegate { UpdateSelectedFriendFromRoster(); };
+            friendJoinList.DoubleClick += delegate { LoadSelectedFriendFromMain(); };
+            friendJoinGroup.Controls.Add(friendJoinList);
+            EnableSoftRoundedEntry(friendJoinList);
+
+            // A shared Friend Group profile can be dropped directly on the
+            // running launcher. Import adds/updates it in the local group collection and
+            // makes it active; import never starts Dolphin or automatically joins.
+            AllowDrop = true;
+            DragEnter += delegate(object sender, DragEventArgs e)
+            {
+                string path = GetDroppedFriendGroupPath(e.Data);
+                e.Effect = !string.IsNullOrWhiteSpace(path) ? DragDropEffects.Copy : DragDropEffects.None;
+            };
+            DragDrop += delegate(object sender, DragEventArgs e)
+            {
+                string path = GetDroppedFriendGroupPath(e.Data);
+                if (!string.IsNullOrWhiteSpace(path)) ImportFriendGroupFromFile(path);
+            };
+            mainPanel.AllowDrop = true;
+            mainPanel.DragEnter += delegate(object sender, DragEventArgs e)
+            {
+                string path = GetDroppedFriendGroupPath(e.Data);
+                e.Effect = !string.IsNullOrWhiteSpace(path) ? DragDropEffects.Copy : DragDropEffects.None;
+            };
+            mainPanel.DragDrop += delegate(object sender, DragEventArgs e)
+            {
+                string path = GetDroppedFriendGroupPath(e.Data);
+                if (!string.IsNullOrWhiteSpace(path)) ImportFriendGroupFromFile(path);
+            };
+
+            dolphinGroup.RaisedSection = true;
+            dolphinGroup.Text = "Dolphin";
+            dolphinGroup.Location = new Point(20, 476);
+            dolphinGroup.Size = new Size(540, 94);
+            dolphinGroup.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            mainPanel.Controls.Add(dolphinGroup);
 
             Label versionLabel = new AdventureLabel();
             versionLabel.Text = version + "   •   Update track: " + updateTrack;
             versionLabel.AutoSize = true;
             versionLabel.BackColor = Color.Transparent;
             versionLabel.Location = new Point(18, 20);
-            dolphin.Controls.Add(versionLabel);
+            dolphinGroup.Controls.Add(versionLabel);
 
             Label dolphinPathLabel = new AdventureLabel();
             string dolphinDirectory = dolphinPaths != null && !string.IsNullOrWhiteSpace(dolphinPaths.DolphinExe)
@@ -10264,26 +12165,26 @@ namespace DolphinNetPlayLauncher
             dolphinPathLabel.AutoSize = false;
             ToolTip dolphinPathTip = new ToolTip();
             dolphinPathTip.SetToolTip(dolphinPathLabel, dolphinDirectory);
-            dolphin.Controls.Add(dolphinPathLabel);
+            dolphinGroup.Controls.Add(dolphinPathLabel);
 
             dolphinUpdateButton.Text = "Check for Update";
             dolphinUpdateButton.Location = new Point(18, 62);
             dolphinUpdateButton.Size = new Size(156, 27);
             dolphinUpdateButton.Click += delegate { if (CheckUpdateRequested != null) CheckUpdateRequested(this, EventArgs.Empty); };
-            dolphin.Controls.Add(dolphinUpdateButton);
+            dolphinGroup.Controls.Add(dolphinUpdateButton);
 
             dolphinOptionsButton.Text = "Options...";
             dolphinOptionsButton.Location = new Point(192, 62);
             dolphinOptionsButton.Size = new Size(156, 27);
             dolphinOptionsButton.Click += delegate { if (OptionsRequested != null) OptionsRequested(this, EventArgs.Empty); };
-            dolphin.Controls.Add(dolphinOptionsButton);
+            dolphinGroup.Controls.Add(dolphinOptionsButton);
 
             dolphinChangeButton.Text = "Change Dolphin...";
             dolphinChangeButton.Location = new Point(366, 62);
             dolphinChangeButton.Size = new Size(156, 27);
             dolphinChangeButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             dolphinChangeButton.Click += delegate { if (ChangeDolphinRequested != null) ChangeDolphinRequested(this, EventArgs.Empty); };
-            dolphin.Controls.Add(dolphinChangeButton);
+            dolphinGroup.Controls.Add(dolphinChangeButton);
 
             lastDolphinControllerControl = dolphinOptionsButton;
 
@@ -10373,7 +12274,11 @@ namespace DolphinNetPlayLauncher
             };
             if (AccentVisuals.Animated(settings))
                 accentUiTimer.Start();
-            FormClosed += delegate { accentUiTimer.Stop(); };
+            FormClosed += delegate
+            {
+                accentUiTimer.Stop();
+                if (sessionBannerCatalog != null) sessionBannerCatalog.Dispose();
+            };
 
             cancelButton.Text = "Cancel";
             cancelButton.Location = new Point(492, 594);
@@ -10396,8 +12301,13 @@ namespace DolphinNetPlayLauncher
                 cancelButton.BringToFront();
                 controllerPromptBar.BringToFront();
             };
-            mainPanel.Resize += delegate { updateBottomLayout(); };
+            mainPanel.Resize += delegate
+            {
+                updateBottomLayout();
+                ApplyResponsiveMainLayout();
+            };
             updateBottomLayout();
+            ApplyNetPlayGameDisplayLayout();
 
             BuildLibraryPanel();
 
@@ -10408,8 +12318,35 @@ namespace DolphinNetPlayLauncher
 
             hostRadio.CheckedChanged += delegate { UpdateMainMode(); };
             joinRadio.CheckedChanged += delegate { UpdateMainMode(); };
+            friendRadio.CheckedChanged += delegate { if (friendRadio.Checked) SwitchJoinModeToFriends(); };
             traversalRadio.CheckedChanged += delegate { if (traversalRadio.Checked) SwitchJoinMode(JoinConnection.Traversal); };
             directRadio.CheckedChanged += delegate { if (directRadio.Checked) SwitchJoinMode(JoinConnection.Direct); };
+
+            friendLoader.DoWork += FriendLoader_DoWork;
+            friendLoader.RunWorkerCompleted += FriendLoader_Completed;
+            friendRefreshTimer.Interval = 25000;
+            friendRefreshTimer.Tick += delegate
+            {
+                if (joinRadio.Checked && friendRadio.Checked && !sessionsVisible && !libraryPanel.Visible)
+                    BeginFriendRefresh(false);
+            };
+            if (settings != null && settings.FriendGroupEnabled)
+                friendRefreshTimer.Start();
+            FormClosed += delegate
+            {
+                friendRefreshTimer.Stop();
+                if (friendRosterBoldFont != null)
+                {
+                    try { friendRosterBoldFont.Dispose(); } catch { }
+                    friendRosterBoldFont = null;
+                }
+                if (friendRosterBadgeFont != null)
+                {
+                    try { friendRosterBadgeFont.Dispose(); } catch { }
+                    friendRosterBadgeFont = null;
+                }
+                ClearFriendCustomBadgeCache();
+            };
 
             if (lastWasDirect) directRadio.Checked = true;
             else traversalRadio.Checked = true;
@@ -10417,6 +12354,15 @@ namespace DolphinNetPlayLauncher
             if (startInJoinMode) joinRadio.Checked = true;
             else hostRadio.Checked = true;
 
+            // Apply friend-group hosting defaults only after the full main UI exists.
+            // Setting the public-host controls fires their normal state-change handlers.
+            ApplyFriendGroupHostDefaults(false);
+            RefreshFriendGroupSelector();
+            friendJoinGroup.Text = BuildFriendGroupCaption();
+            friendJoinList.Font = AppFonts.Create(settings, 9.25F, FontStyle.Regular);
+            friendRosterBoldFont = new Font(friendJoinList.Font, FontStyle.Bold);
+            friendRosterBadgeFont = new Font(friendJoinList.Font.FontFamily, 6.5F, FontStyle.Bold);
+            UpdateJoinConnectionSelectorLayout();
             UpdateMainMode();
             UpdateGameState();
 
@@ -10468,6 +12414,19 @@ namespace DolphinNetPlayLauncher
                             Math.Max(MinimumSize.Height, outer.Height));
             AppTheme.Apply(this, settings);
             AppFonts.Apply(this, settings);
+            friendJoinList.ItemHeight = settings != null &&
+                string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase) ? 36 : 26;
+            if (friendRosterBoldFont != null)
+            {
+                try { friendRosterBoldFont.Dispose(); } catch { }
+            }
+            if (friendRosterBadgeFont != null)
+            {
+                try { friendRosterBadgeFont.Dispose(); } catch { }
+            }
+            friendRosterBoldFont = new Font(friendJoinList.Font, FontStyle.Bold);
+            friendRosterBadgeFont = new Font(friendJoinList.Font.FontFamily, 6.5F, FontStyle.Bold);
+            ApplyResponsiveMainLayout();
 
             // The compact top-row buttons can receive their final size/theme after the
             // initial disabled-state paint. Re-run state styling and repaint them once
@@ -10492,9 +12451,10 @@ namespace DolphinNetPlayLauncher
                     : (AppTheme.IsGameCubeIndigo(settings) ? "indigo"
                     : (AppTheme.IsGameCubeSpice(settings) ? "spice"
                     : (AppTheme.IsDark(settings) ? "dark" : "light"))));
-                string themed = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                string iconsFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "Icons");
+                string themed = Path.Combine(iconsFolder,
                     "DolphinNetPlayLauncher-icon-" + suffix + ".png");
-                string fallback = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DolphinNetPlayLauncher-icon.png");
+                string fallback = Path.Combine(iconsFolder, "DolphinNetPlayLauncher-icon.png");
                 string path = File.Exists(themed) ? themed : fallback;
                 if (!File.Exists(path)) return;
                 Image old = launcherLogo.Image;
@@ -10769,6 +12729,8 @@ namespace DolphinNetPlayLauncher
             gameList.DoubleClick += delegate
             {
                 StageCurrentLibraryGame();
+                if (!string.IsNullOrWhiteSpace(pendingLibraryGamePath))
+                    UiSoundManager.PlayNamed(settings, "use_game");
                 CommitPendingLibraryGame();
             };
             gameList.MouseClick += delegate
@@ -11245,6 +13207,8 @@ namespace DolphinNetPlayLauncher
                 EventHandler chooseAndCommit = delegate
                 {
                     choose(null, EventArgs.Empty);
+                    if (!string.IsNullOrWhiteSpace(pendingLibraryGamePath))
+                        UiSoundManager.PlayNamed(settings, "use_game");
                     CommitPendingLibraryGame();
                 };
 
@@ -11461,7 +13425,7 @@ namespace DolphinNetPlayLauncher
                 "https://lobby.dolphin-emu.org");
 
             embeddedSessionsBrowser = new PublicSessionsForm(
-                settings, indexServer, dolphinVersion, true);
+                settings, indexServer, dolphinVersion, true, sessionBannerCatalog);
             embeddedSessionsBrowser.TopLevel = false;
             embeddedSessionsBrowser.FormBorderStyle = FormBorderStyle.None;
             embeddedSessionsBrowser.Dock = DockStyle.Fill;
@@ -11649,8 +13613,8 @@ namespace DolphinNetPlayLauncher
             if (string.IsNullOrWhiteSpace(selectedGamePath) || dolphinPaths == null)
             {
                 gameBanner.Visible = false;
-                gameLabel.Location = new Point(100, 62);
-                gameMetaLabel.Location = new Point(100, 84);
+                gameLabel.Location = new Point(88, 52);
+                gameMetaLabel.Location = new Point(88, 74);
                 return;
             }
 
@@ -11661,16 +13625,16 @@ namespace DolphinNetPlayLauncher
                 {
                     gameBanner.Image = banner;
                     gameBanner.Visible = true;
-                    gameLabel.Location = new Point(100, 88);
-                    gameMetaLabel.Location = new Point(100, 110);
+                    gameLabel.Location = new Point(88, 78);
+                    gameMetaLabel.Location = new Point(88, 100);
                     return;
                 }
             }
             catch { }
 
             gameBanner.Visible = false;
-            gameLabel.Left = 100;
-            gameMetaLabel.Left = 100;
+            gameLabel.Left = 88;
+            gameMetaLabel.Left = 88;
         }
 
         private void QueueLibraryPreviewUpdate()
@@ -12238,6 +14202,12 @@ namespace DolphinNetPlayLauncher
 
         public void RefreshThemeVisuals()
         {
+            // AppFonts.Apply() recalculates ordinary ListBox row heights during
+            // theme/font changes. The accepted Friends banner row is intentionally 36px,
+            // but that generic refresh can collapse it back to the old ~26px row. Reassert
+            // the current Plain/Banners NetPlay geometry immediately after a theme refresh.
+            ApplyNetPlayGameDisplayLayout();
+
             Font oldGridRegularFont = libraryGridRegularFont;
             Font oldGridBoldFont = libraryGridBoldFont;
             libraryGridRegularFont = AppFonts.Create(settings, 8.25F, FontStyle.Regular);
@@ -12530,7 +14500,11 @@ namespace DolphinNetPlayLauncher
         {
             bool hasGame = !string.IsNullOrWhiteSpace(selectedGamePath);
             if (joinRadio.Checked)
+            {
+                if (friendRadio.Checked)
+                    return IsFriendSessionJoinable(selectedFriendSession);
                 return !string.IsNullOrWhiteSpace(targetBox.Text);
+            }
 
             if (!hasGame)
                 return false;
@@ -12586,7 +14560,7 @@ namespace DolphinNetPlayLauncher
 
         public void FocusPasteFromController()
         {
-            if (joinRadio.Checked && pasteButton.Visible && pasteButton.Enabled)
+            if (joinRadio.Checked && !friendRadio.Checked && pasteButton.Visible && pasteButton.Enabled)
                 pasteButton.Focus();
         }
 
@@ -12719,6 +14693,8 @@ namespace DolphinNetPlayLauncher
                 {
                     if (joinRadio.Checked)
                         FocusSelectedJoinType();
+                    else if (friendHostCheck.Visible && friendHostCheck.Enabled)
+                        friendHostCheck.Focus();
                     else
                         publicHostCheck.Focus();
                     return true;
@@ -12726,9 +14702,83 @@ namespace DolphinNetPlayLauncher
                 return false;
             }
 
-            if (active == publicHostCheck)
+            if (active == friendHostCheck)
             {
                 if (action == ControllerAction.Up) { nickBox.Focus(); return true; }
+                if (action == ControllerAction.Right && friendHostGroupSelectorBox.Visible) { friendHostGroupSelectorBox.Focus(); return true; }
+                if (action == ControllerAction.Down)
+                {
+                    if (friendHostCheck.Checked) FocusDolphinTool(lastDolphinControllerControl);
+                    else publicHostCheck.Focus();
+                    return true;
+                }
+                if (action == ControllerAction.Accept)
+                {
+                    if (friendHostCheck.Enabled) friendHostCheck.Checked = !friendHostCheck.Checked;
+                    return true;
+                }
+                return false;
+            }
+
+            if (active == friendHostGroupSelectorBox)
+            {
+                if (friendHostGroupSelectorBox.DroppedDown)
+                {
+                    if (action == ControllerAction.Cancel)
+                    {
+                        friendGroupSelectorUpdating = true;
+                        try
+                        {
+                            for (int i = 0; i < friendHostGroupSelectorBox.Items.Count; i++)
+                            {
+                                FriendGroupEntry entry = friendHostGroupSelectorBox.Items[i] as FriendGroupEntry;
+                                if (entry != null && string.Equals(entry.Id, settings.FriendActiveGroupId, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    friendHostGroupSelectorBox.SelectedIndex = i;
+                                    break;
+                                }
+                            }
+                            friendHostGroupSelectorBox.DroppedDown = false;
+                        }
+                        finally { friendGroupSelectorUpdating = false; }
+                        return true;
+                    }
+                    return false;
+                }
+                if (action == ControllerAction.Left) { friendHostCheck.Focus(); return true; }
+                if (action == ControllerAction.Right && friendHostManageButton.Visible) { friendHostManageButton.Focus(); return true; }
+                if (action == ControllerAction.Up) { nickBox.Focus(); return true; }
+                if (action == ControllerAction.Down)
+                {
+                    if (friendHostCheck.Checked) FocusDolphinTool(lastDolphinControllerControl);
+                    else publicHostCheck.Focus();
+                    return true;
+                }
+                if (action == ControllerAction.Accept)
+                {
+                    friendHostGroupSelectorBox.DroppedDown = true;
+                    return true;
+                }
+                return false;
+            }
+
+            if (active == friendHostManageButton)
+            {
+                if (action == ControllerAction.Left) { if (friendHostGroupSelectorBox.Visible) friendHostGroupSelectorBox.Focus(); else friendHostCheck.Focus(); return true; }
+                if (action == ControllerAction.Up) { nickBox.Focus(); return true; }
+                if (action == ControllerAction.Down)
+                {
+                    if (friendHostCheck.Checked) FocusDolphinTool(lastDolphinControllerControl);
+                    else publicHostCheck.Focus();
+                    return true;
+                }
+                if (action == ControllerAction.Accept) { friendHostManageButton.PerformClick(); return true; }
+                return false;
+            }
+
+            if (active == publicHostCheck)
+            {
+                if (action == ControllerAction.Up) { if (friendHostCheck.Visible) friendHostCheck.Focus(); else nickBox.Focus(); return true; }
                 if (action == ControllerAction.Down)
                 {
                     if (publicHostCheck.Checked) publicSessionNameBox.Focus();
@@ -12737,7 +14787,7 @@ namespace DolphinNetPlayLauncher
                 }
                 if (action == ControllerAction.Accept)
                 {
-                    publicHostCheck.Checked = !publicHostCheck.Checked;
+                    if (publicHostCheck.Enabled) publicHostCheck.Checked = !publicHostCheck.Checked;
                     return true;
                 }
                 return false;
@@ -12786,19 +14836,70 @@ namespace DolphinNetPlayLauncher
                 return false;
             }
 
-            // Traversal/Direct is also one logical selector row.
-            if (active == traversalRadio || active == directRadio)
+            // Traversal / Friends / Direct IP is one logical selector row when a
+            // friend group is configured. Friends stays physically and logically centered
+            // because it is the primary 0.12 Join workflow. Without Friends, preserve the
+            // original two-way Traversal / Direct behavior.
+            if (active == friendRadio || active == traversalRadio || active == directRadio)
             {
                 if (action == ControllerAction.Left)
                 {
-                    traversalRadio.Checked = true;
-                    traversalRadio.Focus();
+                    if (friendRadio.Visible)
+                    {
+                        if (active == directRadio)
+                        {
+                            friendRadio.Checked = true;
+                            friendRadio.Focus();
+                        }
+                        else if (active == friendRadio)
+                        {
+                            traversalRadio.Checked = true;
+                            traversalRadio.Focus();
+                        }
+                        else
+                        {
+                            traversalRadio.Focus();
+                        }
+                    }
+                    else if (active == directRadio)
+                    {
+                        traversalRadio.Checked = true;
+                        traversalRadio.Focus();
+                    }
+                    else
+                    {
+                        traversalRadio.Focus();
+                    }
                     return true;
                 }
                 if (action == ControllerAction.Right)
                 {
-                    directRadio.Checked = true;
-                    directRadio.Focus();
+                    if (friendRadio.Visible)
+                    {
+                        if (active == traversalRadio)
+                        {
+                            friendRadio.Checked = true;
+                            friendRadio.Focus();
+                        }
+                        else if (active == friendRadio)
+                        {
+                            directRadio.Checked = true;
+                            directRadio.Focus();
+                        }
+                        else
+                        {
+                            directRadio.Focus();
+                        }
+                    }
+                    else if (active == traversalRadio)
+                    {
+                        directRadio.Checked = true;
+                        directRadio.Focus();
+                    }
+                    else
+                    {
+                        directRadio.Focus();
+                    }
                     return true;
                 }
                 if (action == ControllerAction.Up)
@@ -12808,7 +14909,123 @@ namespace DolphinNetPlayLauncher
                 }
                 if (action == ControllerAction.Down)
                 {
-                    targetBox.Focus();
+                    if (friendRadio.Checked)
+                    {
+                        if (friendJoinList.Items.Count > 0)
+                        {
+                            if (friendJoinList.SelectedIndex < 0) friendJoinList.SelectedIndex = 0;
+                            friendJoinList.Focus();
+                        }
+                        else if (friendGroupSelectorBox.Visible)
+                            friendGroupSelectorBox.Focus();
+                        else
+                            friendRefreshButton.Focus();
+                    }
+                    else
+                        targetBox.Focus();
+                    return true;
+                }
+                return false;
+            }
+
+            if (active == friendJoinList)
+            {
+                // The Friends roster has explicit section boundaries instead of
+                // clamping at either end. Up from the first Friend returns to the
+                // connection selector; Down from the last Friend enters the Dolphin
+                // utility row. Explicit TopIndex updates also make owner-drawn roster
+                // scrolling deterministic in both directions.
+                if (action == ControllerAction.Up)
+                {
+                    MoveFriendRosterSelection(-1);
+                    return true;
+                }
+                if (action == ControllerAction.Down)
+                {
+                    MoveFriendRosterSelection(1);
+                    return true;
+                }
+                if (action == ControllerAction.Left) { friendGroupSelectorBox.Focus(); return true; }
+                if (action == ControllerAction.Right) { friendRefreshButton.Focus(); return true; }
+                if (action == ControllerAction.Accept) { LoadSelectedFriendFromMain(); return true; }
+                if (action == ControllerAction.Cancel) { FocusSelectedJoinType(); return true; }
+                return false;
+            }
+
+            if (active == friendGroupSelectorBox || active == friendRouteButton || active == friendGroupManageButton || active == friendRefreshButton)
+            {
+                // If the ComboBox dropdown is open, let native ComboBox navigation handle
+                // its Up/Down/Accept behavior. Outside the dropdown, this is one contained
+                // horizontal row: Group selector <-> Group... <-> Refresh.
+                if (active == friendGroupSelectorBox && friendGroupSelectorBox.DroppedDown)
+                {
+                    if (action == ControllerAction.Cancel)
+                    {
+                        // Cancel must not commit whichever group was merely highlighted while
+                        // browsing the open ComboBox. Restore the still-active group before
+                        // closing; DropDownClosed sees the update guard and skips activation.
+                        friendGroupSelectorUpdating = true;
+                        try
+                        {
+                            for (int i = 0; i < friendGroupSelectorBox.Items.Count; i++)
+                            {
+                                FriendGroupEntry entry = friendGroupSelectorBox.Items[i] as FriendGroupEntry;
+                                if (entry != null && string.Equals(entry.Id, settings.FriendActiveGroupId, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    friendGroupSelectorBox.SelectedIndex = i;
+                                    break;
+                                }
+                            }
+                            friendGroupSelectorBox.DroppedDown = false;
+                        }
+                        finally
+                        {
+                            friendGroupSelectorUpdating = false;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                if (action == ControllerAction.Left)
+                {
+                    if (active == friendRefreshButton) friendGroupManageButton.Focus();
+                    else if (active == friendGroupManageButton && friendRouteButton.Visible) friendRouteButton.Focus();
+                    else friendGroupSelectorBox.Focus();
+                    return true;
+                }
+                if (action == ControllerAction.Right)
+                {
+                    if (active == friendGroupSelectorBox)
+                    {
+                        if (friendRouteButton.Visible) friendRouteButton.Focus();
+                        else friendGroupManageButton.Focus();
+                    }
+                    else if (active == friendRouteButton) friendGroupManageButton.Focus();
+                    else friendRefreshButton.Focus();
+                    return true;
+                }
+                if (action == ControllerAction.Up) { FocusSelectedJoinType(); return true; }
+                if (action == ControllerAction.Down)
+                {
+                    if (friendJoinList.Items.Count > 0)
+                    {
+                        if (friendJoinList.SelectedIndex < 0) friendJoinList.SelectedIndex = 0;
+                        friendJoinList.Focus();
+                    }
+                    else
+                        FocusDolphinTool(lastDolphinControllerControl);
+                    return true;
+                }
+                if (action == ControllerAction.Accept)
+                {
+                    if (active == friendGroupSelectorBox)
+                        friendGroupSelectorBox.DroppedDown = true;
+                    else if (active == friendRouteButton)
+                        friendRouteButton.PerformClick();
+                    else if (active == friendGroupManageButton)
+                        friendGroupManageButton.PerformClick();
+                    else
+                        friendRefreshButton.PerformClick();
                     return true;
                 }
                 return false;
@@ -12916,6 +15133,43 @@ namespace DolphinNetPlayLauncher
             return false;
         }
 
+        private void MoveFriendRosterSelection(int delta)
+        {
+            int count = friendJoinList.Items.Count;
+            if (count <= 0)
+            {
+                if (delta < 0) FocusSelectedJoinType();
+                else FocusDolphinTool(lastDolphinControllerControl);
+                return;
+            }
+
+            int current = friendJoinList.SelectedIndex;
+            if (current < 0) current = delta < 0 ? 0 : -1;
+            int next = current + (delta < 0 ? -1 : 1);
+
+            if (next < 0)
+            {
+                FocusSelectedJoinType();
+                return;
+            }
+            if (next >= count)
+            {
+                FocusDolphinTool(lastDolphinControllerControl);
+                return;
+            }
+
+            friendJoinList.SelectedIndex = next;
+            // Owner-drawn WinForms ListBox scrolling can lag behind selection changes
+            // when driven rapidly from a controller. Keep the selected row explicitly
+            // visible so Up works just as reliably as Down.
+            int visibleRows = Math.Max(1, friendJoinList.ClientSize.Height / Math.Max(1, friendJoinList.ItemHeight));
+            int top = friendJoinList.TopIndex;
+            if (next < top)
+                friendJoinList.TopIndex = next;
+            else if (next >= top + visibleRows)
+                friendJoinList.TopIndex = Math.Max(0, next - visibleRows + 1);
+        }
+
         private void FocusSelectedMode()
         {
             if (joinRadio.Checked)
@@ -12926,7 +15180,9 @@ namespace DolphinNetPlayLauncher
 
         private void FocusSelectedJoinType()
         {
-            if (directRadio.Checked)
+            if (friendRadio.Visible && friendRadio.Checked)
+                friendRadio.Focus();
+            else if (directRadio.Checked)
                 directRadio.Focus();
             else
                 traversalRadio.Focus();
@@ -12947,7 +15203,22 @@ namespace DolphinNetPlayLauncher
         {
             if (!joinRadio.Checked)
             {
-                nickBox.Focus();
+                if (friendHostCheck.Visible && friendHostCheck.Enabled) friendHostCheck.Focus();
+                else nickBox.Focus();
+                return;
+            }
+
+            if (friendRadio.Checked && friendJoinGroup.Visible)
+            {
+                if (friendJoinList.Items.Count > 0)
+                {
+                    if (friendJoinList.SelectedIndex < 0) friendJoinList.SelectedIndex = 0;
+                    friendJoinList.Focus();
+                }
+                else if (friendGroupSelectorBox.Visible)
+                    friendGroupSelectorBox.Focus();
+                else
+                    friendRefreshButton.Focus();
                 return;
             }
 
@@ -12974,7 +15245,7 @@ namespace DolphinNetPlayLauncher
             bool adventure = AppTheme.IsAdventure(settings);
             bool oled = AppTheme.IsOled(settings);
             bool cube = AppTheme.IsGameCube(settings);
-            RadioButton[] selectors = new RadioButton[] { hostRadio, joinRadio, traversalRadio, directRadio };
+            RadioButton[] selectors = new RadioButton[] { hostRadio, joinRadio, friendRadio, traversalRadio, directRadio };
             foreach (RadioButton rb in selectors)
             {
                 bool selected = rb.Checked;
@@ -13027,34 +15298,917 @@ namespace DolphinNetPlayLauncher
             connectionSelectorPanel.Invalidate();
         }
 
+        private void OpenFriendOptions()
+        {
+            friendOptionsRequested = true;
+            if (OptionsRequested != null) OptionsRequested(this, EventArgs.Empty);
+        }
+
+        public bool ConsumeFriendOptionsRequest()
+        {
+            bool requested = friendOptionsRequested;
+            friendOptionsRequested = false;
+            return requested;
+        }
+
+        private static string GetDroppedFriendGroupPath(IDataObject data)
+        {
+            try
+            {
+                if (data == null || !data.GetDataPresent(DataFormats.FileDrop)) return "";
+                string[] files = data.GetData(DataFormats.FileDrop) as string[];
+                if (files == null || files.Length != 1) return "";
+                string path = files[0] ?? "";
+                return string.Equals(Path.GetExtension(path), ".dnlgroup", StringComparison.OrdinalIgnoreCase)
+                    ? path : "";
+            }
+            catch { return ""; }
+        }
+
+        private void ImportFriendGroupFromFile(string path)
+        {
+            FriendGroupProfile profile;
+            string error;
+            if (!FriendGroupProfileFile.TryLoad(path, out profile, out error))
+            {
+                MessageBox.Show(error, "Import Friend Group", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string self = FriendGroupIdentityForm.ChooseIdentity(this, settings, profile, null);
+            if (string.IsNullOrWhiteSpace(self)) return;
+
+            FriendGroupCollectionCodec.UpsertImported(settings, profile, self);
+            Program.SaveDnlSettings(settings);
+            ApplyFriendGroupSettingsFromOptions();
+            MessageBox.Show(
+                "Friend group '" + settings.FriendGroupName + "' is now active.\n\n" +
+                "Your friend name: " + settings.FriendMySessionName,
+                "Friend Group Imported",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        private void RefreshFriendGroupSelector()
+        {
+            if (settings == null) return;
+            List<FriendGroupEntry> groups = FriendGroupCollectionCodec.GetGroups(settings);
+            friendGroupSelectorUpdating = true;
+            try
+            {
+                FillFriendGroupSelector(friendGroupSelectorBox, groups);
+                FillFriendGroupSelector(friendHostGroupSelectorBox, groups);
+            }
+            finally { friendGroupSelectorUpdating = false; }
+        }
+
+        private void FillFriendGroupSelector(ComboBox box, List<FriendGroupEntry> groups)
+        {
+            if (box == null || box.IsDisposed) return;
+            box.Items.Clear();
+            int selected = -1;
+            for (int i = 0; i < groups.Count; i++)
+            {
+                FriendGroupEntry entry = groups[i];
+                box.Items.Add(entry);
+                if (entry != null && string.Equals(entry.Id, settings.FriendActiveGroupId, StringComparison.OrdinalIgnoreCase))
+                    selected = i;
+            }
+            if (selected < 0 && box.Items.Count > 0) selected = 0;
+            if (selected >= 0) box.SelectedIndex = selected;
+            box.Visible = settings.FriendGroupEnabled && box.Items.Count > 0;
+        }
+
+        private void ActivateFriendGroupFromMainSelection()
+        {
+            ActivateFriendGroupFromSelector(friendGroupSelectorBox);
+        }
+
+        private void ActivateFriendGroupFromHostSelection()
+        {
+            ActivateFriendGroupFromSelector(friendHostGroupSelectorBox);
+        }
+
+        private void ActivateFriendGroupFromSelector(ComboBox selector)
+        {
+            if (settings == null || selector == null || selector.SelectedItem == null) return;
+            FriendGroupEntry selected = selector.SelectedItem as FriendGroupEntry;
+            if (selected == null || string.IsNullOrWhiteSpace(selected.Id) ||
+                string.Equals(selected.Id, settings.FriendActiveGroupId, StringComparison.OrdinalIgnoreCase)) return;
+
+            if (!FriendGroupCollectionCodec.Activate(settings, selected.Id)) return;
+            Program.SaveDnlSettings(settings);
+            selectedFriendSession = null;
+            loadedFriendName = "";
+            loadedFriendLanAddress = "";
+            loadedFriendLanPort = 0;
+            loadedFriendUseLan = false;
+            friendLanOverrideCacheRaw = null;
+            ApplyFriendGroupHostDefaults(false);
+            friendJoinGroup.Text = BuildFriendGroupCaption();
+            PopulateFriendJoinList();
+            if (joinRadio.Checked && friendRadio.Checked) BeginFriendRefresh(true);
+            UpdateMainMode();
+            DiagnosticsLog.Write("FRIENDS", "Active Friend Group changed to '" + settings.FriendGroupName + "'.");
+        }
+
+        private void ApplyFriendGroupHostDefaults(bool fromOptions)
+        {
+            if (settings == null) return;
+
+            sessionsButton.Text = "Sessions...";
+            FriendGroupCollectionCodec.EnsureCollectionAndActiveProjection(settings);
+            friendRadio.Visible = settings.FriendGroupEnabled;
+            friendHostCheck.Visible = settings.FriendGroupEnabled;
+            friendHostManageButton.Visible = settings.FriendGroupEnabled;
+            friendHostGroupSelectorBox.Visible = settings.FriendGroupEnabled;
+            friendGroupManageButton.Visible = settings.FriendGroupEnabled;
+            RefreshFriendGroupSelector();
+            friendHostCheck.Text = "Use friend group";
+
+            bool configured = settings.FriendGroupEnabled &&
+                !string.IsNullOrWhiteSpace(settings.FriendMySessionName) &&
+                !string.IsNullOrWhiteSpace(settings.FriendGroupPassword);
+            friendHostCheck.Enabled = configured;
+
+            if (!configured)
+            {
+                friendHostCheck.Checked = false;
+                UpdatePublicHostUi();
+                UpdateJoinConnectionSelectorLayout();
+                return;
+            }
+
+            friendHostCheck.Checked = settings.FriendAutoHost;
+            if (friendHostCheck.Checked)
+                ApplyFriendGroupHostValues();
+
+            UpdatePublicHostUi();
+            UpdateJoinConnectionSelectorLayout();
+        }
+
+        private void ApplyFriendIdentityNickname()
+        {
+            if (settings == null || !settings.FriendGroupEnabled || nickBox == null) return;
+
+            string identity = Program.RemoveUnsafeIniCharacters(settings.FriendMySessionName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(identity)) return;
+            if (string.Equals(nickBox.Text, identity, StringComparison.Ordinal)) return;
+
+            nickBox.Text = identity;
+            nickBox.SelectionStart = nickBox.Text.Length;
+            DiagnosticsLog.Write("FRIENDS", "Nickname matched to active Friend Group identity.");
+        }
+
+        private void ApplyFriendGroupHostValues()
+        {
+            if (settings == null || !settings.FriendGroupEnabled) return;
+            if (string.IsNullOrWhiteSpace(settings.FriendMySessionName) ||
+                string.IsNullOrWhiteSpace(settings.FriendGroupPassword)) return;
+
+            if (!joinRadio.Checked) ApplyFriendIdentityNickname();
+            publicHostCheck.Checked = true;
+            publicSessionNameBox.Text = Program.RemoveUnsafeIniCharacters(settings.FriendMySessionName).Trim();
+            publicPasswordBox.Text = Program.RemoveUnsafeIniCharacters(settings.FriendGroupPassword);
+
+            string region = Program.NormalizeFriendRegion(settings.FriendRegion);
+            for (int i = 0; i < publicRegionBox.Items.Count; i++)
+            {
+                if (publicRegionBox.Items[i].ToString().EndsWith("(" + region + ")", StringComparison.OrdinalIgnoreCase))
+                {
+                    publicRegionBox.SelectedIndex = i;
+                    break;
+                }
+            }
+
+            DiagnosticsLog.Write("FRIENDS",
+                "Friend-group public-host values applied (session name/password redacted; region " + region + ").");
+        }
+
+        public void ApplyFriendGroupSettingsFromOptions()
+        {
+            ApplyFriendGroupHostDefaults(true);
+            if (settings != null && settings.FriendGroupEnabled) friendRefreshTimer.Start();
+            else friendRefreshTimer.Stop();
+            if (settings != null) settings.FriendShowOffline = false;
+            RefreshFriendGroupSelector();
+            friendJoinGroup.Text = BuildFriendGroupCaption();
+            ApplyNetPlayGameDisplayLayout();
+            if (friendRosterBoldFont != null)
+            {
+                try { friendRosterBoldFont.Dispose(); } catch { }
+            }
+            if (friendRosterBadgeFont != null)
+            {
+                try { friendRosterBadgeFont.Dispose(); } catch { }
+            }
+            friendRosterBoldFont = new Font(friendJoinList.Font, FontStyle.Bold);
+            friendRosterBadgeFont = new Font(friendJoinList.Font.FontFamily, 6.5F, FontStyle.Bold);
+            ClearFriendCustomBadgeCache();
+            if (!string.IsNullOrWhiteSpace(loadedFriendName) && selectedFriendSession != null)
+                ApplyLoadedFriendLanOverride(loadedFriendName, true);
+            UpdateFriendRouteUi();
+            if (settings != null && settings.FriendGroupEnabled && joinRadio.Checked && friendRadio.Checked)
+                BeginFriendRefresh(true);
+            else
+                PopulateFriendJoinList();
+            if (embeddedSessionsBrowser != null && !embeddedSessionsBrowser.IsDisposed)
+                embeddedSessionsBrowser.RefreshSessions();
+            UpdateMainMode();
+        }
+
         private void UpdatePublicHostUi()
         {
             bool enabled = publicHostCheck.Checked;
-            publicSessionNameBox.Enabled = enabled;
-            publicRegionBox.Enabled = enabled;
-            publicPasswordBox.Enabled = enabled;
+            bool friendManaged = friendHostCheck.Visible && friendHostCheck.Checked;
+            publicHostCheck.Enabled = !friendManaged;
+            publicSessionNameBox.Enabled = enabled && !friendManaged;
+            publicRegionBox.Enabled = enabled && !friendManaged;
+            publicPasswordBox.Enabled = enabled && !friendManaged;
         }
 
         private void UpdateMainMode()
         {
             bool join = joinRadio.Checked;
+
+            // Entering Join with a configured Friend Group always defaults to
+            // Friends. Do not consult friendRadio.Visible here: WinForms reports a child
+            // control as not visible while its parent CONNECTION panel is hidden in Host
+            // mode, which previously allowed the remembered Traversal/Direct route to win
+            // on the first Host -> Join transition. Manual Traversal/Direct selection
+            // remains respected until the user leaves Join and comes back later.
+            bool friendsAvailable = settings != null && settings.FriendGroupEnabled;
+            if (join && !lastMainModeWasJoin && friendsAvailable)
+                friendRadio.Checked = true;
+
             UpdateSelectorVisuals();
             connectionHeading.Visible = join;
             connectionSelectorPanel.Visible = join;
             publicHostGroup.Visible = !join;
             UpdatePublicHostUi();
-            targetLabel.Visible = join;
-            targetBox.Visible = join;
-            pasteButton.Visible = join;
-            portLabel.Visible = join && directRadio.Checked;
-            portBox.Visible = join && directRadio.Checked;
+
+            bool friendsMode = join && friendsAvailable && friendRadio.Checked;
+            if (friendsMode) ApplyFriendIdentityNickname();
+            friendJoinGroup.Visible = friendsMode;
+            friendJoinGroup.Text = BuildFriendGroupCaption();
+            targetLabel.Visible = join && !friendsMode;
+            targetBox.Visible = join && !friendsMode;
+            pasteButton.Visible = join && !friendsMode;
+            portLabel.Visible = join && !friendsMode && directRadio.Checked;
+            portBox.Visible = join && !friendsMode && directRadio.Checked;
             goButton.Text = join ? "▶  Join" : "▶  Host";
 
-            controllerPromptBar.ShowPasteShortcut = join;
+            controllerPromptBar.ShowPasteShortcut = join && !friendsMode;
             controllerPromptBar.PrimaryAction = join ? "Join" : "Host";
             controllerPromptBar.Invalidate();
 
+            if (friendsMode && !lastMainModeWasJoin)
+                BeginFriendRefresh(false);
+
+            lastMainModeWasJoin = join;
+            ApplyResponsiveMainLayout();
             UpdateGameState();
+        }
+
+        private sealed class FriendRosterItem
+        {
+            public string Name = "";
+            public PublicNetPlaySession Session;
+            public bool Offline { get { return Session == null; } }
+            public override string ToString() { return Name; }
+        }
+
+        private string BuildFriendGroupCaption()
+        {
+            string name = settings != null ? settings.FriendGroupName : "";
+            if (string.IsNullOrWhiteSpace(name)) name = "Friends";
+            return "FRIENDS — " + name;
+        }
+
+        private static List<string> ParseConfiguredFriendNamesOrdered(string raw)
+        {
+            List<string> result = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+            string normalized = raw.Replace("\r", "\n");
+            foreach (string part in normalized.Split(new char[] { '\n', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = Program.RemoveUnsafeIniCharacters(part).Trim();
+                if (name.Length > 0 && seen.Add(name)) result.Add(name);
+            }
+            return result;
+        }
+
+        private bool FriendVersionMismatch(PublicNetPlaySession session)
+        {
+            return session != null && !string.IsNullOrWhiteSpace(dolphinVersion) &&
+                !string.IsNullOrWhiteSpace(session.Version) &&
+                !PublicSessionsForm.DolphinVersionsMatch(dolphinVersion, session.Version);
+        }
+
+        private bool IsFriendSessionJoinable(PublicNetPlaySession session)
+        {
+            return session != null && session.IsFriend && !session.InGame &&
+                !FriendVersionMismatch(session) &&
+                !string.IsNullOrWhiteSpace(session.FriendResolvedServerId);
+        }
+
+        private string GetFriendIndexServer()
+        {
+            return Program.ReadIni(
+                dolphinPaths != null ? dolphinPaths.DolphinIni : "",
+                "NetPlay", "IndexServer", "https://lobby.dolphin-emu.org");
+        }
+
+        private void BeginFriendRefresh(bool explicitRefresh)
+        {
+            if (settings == null || !settings.FriendGroupEnabled || !friendRadio.Visible)
+                return;
+
+            if (friendLoader.IsBusy)
+            {
+                if (explicitRefresh) friendRefreshPending = true;
+                return;
+            }
+
+            friendRefreshButton.Enabled = false;
+            friendJoinStatusLabel.Text = "Checking for friends...";
+            string indexServer = GetFriendIndexServer();
+            DiagnosticsLog.Write("FRIENDS", "Refreshing friend roster from Dolphin public lobby.");
+            friendLoader.RunWorkerAsync(indexServer);
+        }
+
+        private void FriendLoader_DoWork(object sender, DoWorkEventArgs e)
+        {
+            string indexServer = Convert.ToString(e.Argument);
+            List<PublicNetPlaySession> loaded = PublicSessionsForm.FetchSessionsForDiscovery(indexServer);
+            PublicSessionsForm.ClassifyFriendSessionsForDiscovery(loaded, settings);
+            PublicSessionsForm.SortSessionsForDiscovery(loaded);
+            if (sessionBannerCatalog != null && settings != null &&
+                string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase))
+                sessionBannerCatalog.Preload(loaded);
+            e.Result = loaded;
+        }
+
+        private void FriendLoader_Completed(object sender, RunWorkerCompletedEventArgs e)
+        {
+            if (IsDisposed) return;
+            friendRefreshButton.Enabled = true;
+
+            if (e.Error != null)
+            {
+                DiagnosticsLog.Exception("Friend roster refresh failed", e.Error);
+                friendJoinStatusLabel.Text = "Could not refresh friends";
+            }
+            else
+            {
+                friendDiscoverySessions.Clear();
+                List<PublicNetPlaySession> loaded = e.Result as List<PublicNetPlaySession>;
+                if (loaded != null) friendDiscoverySessions.AddRange(loaded);
+                PopulateFriendJoinList();
+
+                int recognized = 0;
+                foreach (PublicNetPlaySession session in friendDiscoverySessions)
+                    if (session != null && session.IsFriend) recognized++;
+                DiagnosticsLog.Write("FRIENDS", "Friend roster refresh completed: " +
+                    recognized.ToString() + " recognized friend session(s); targets redacted.");
+            }
+
+            if (friendRefreshPending)
+            {
+                friendRefreshPending = false;
+                BeginFriendRefresh(false);
+            }
+        }
+
+        private static int FriendSessionPreference(PublicNetPlaySession session, string localVersion)
+        {
+            if (session == null) return -100;
+            int score = 0;
+            if (!session.InGame) score += 4;
+            if (string.IsNullOrWhiteSpace(localVersion) || string.IsNullOrWhiteSpace(session.Version) ||
+                PublicSessionsForm.DolphinVersionsMatch(localVersion, session.Version)) score += 2;
+            if (!string.IsNullOrWhiteSpace(session.FriendResolvedServerId)) score += 1;
+            return score;
+        }
+
+        private void PopulateFriendJoinList()
+        {
+            if (friendJoinList == null || friendJoinList.IsDisposed) return;
+
+            string previouslySelected = "";
+            FriendRosterItem previous = friendJoinList.SelectedItem as FriendRosterItem;
+            if (previous != null) previouslySelected = previous.Name;
+
+            List<string> names = ParseConfiguredFriendNamesOrdered(settings != null ? settings.FriendNames : "");
+            Dictionary<string, PublicNetPlaySession> online =
+                new Dictionary<string, PublicNetPlaySession>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (PublicNetPlaySession session in friendDiscoverySessions)
+            {
+                if (session == null || !session.IsFriend || string.IsNullOrWhiteSpace(session.Name)) continue;
+                string name = session.Name.Trim();
+                PublicNetPlaySession current;
+                if (!online.TryGetValue(name, out current) ||
+                    FriendSessionPreference(session, dolphinVersion) > FriendSessionPreference(current, dolphinVersion))
+                    online[name] = session;
+            }
+
+            // The highlighted list row and the loaded Join target are deliberately
+            // separate. Preserve an explicitly loaded friend across background refreshes,
+            // but never turn mere cursor movement into a connection choice.
+            selectedFriendSession = null;
+            loadedFriendLanAddress = "";
+            loadedFriendLanPort = 0;
+            if (!string.IsNullOrWhiteSpace(loadedFriendName))
+            {
+                PublicNetPlaySession loaded;
+                if (online.TryGetValue(loadedFriendName, out loaded) && IsFriendSessionJoinable(loaded))
+                {
+                    selectedFriendSession = loaded;
+                    ApplyLoadedFriendLanOverride(loadedFriendName, false);
+                }
+            }
+
+            friendJoinList.BeginUpdate();
+            friendJoinList.Items.Clear();
+
+            string selfName = settings != null ? (settings.FriendMySessionName ?? "").Trim() : "";
+            // .dnlgroup profiles contain every member so the same file can be shared
+            // unchanged. Local settings already split the chosen identity from the
+            // other members, and the roster defensively excludes self as well. The
+            // Friends list is for join targets only; never add a synthetic "You" row.
+            foreach (string name in names)
+            {
+                if (!string.IsNullOrWhiteSpace(selfName) &&
+                    string.Equals(name, selfName, StringComparison.OrdinalIgnoreCase)) continue;
+                PublicNetPlaySession session;
+                if (!online.TryGetValue(name, out session)) continue;
+                FriendRosterItem item = new FriendRosterItem();
+                item.Name = name;
+                item.Session = session;
+                friendJoinList.Items.Add(item);
+            }
+            friendJoinList.EndUpdate();
+
+            int selectedIndex = -1;
+            int firstJoinable = -1;
+            int onlineCount = 0;
+            for (int i = 0; i < friendJoinList.Items.Count; i++)
+            {
+                FriendRosterItem item = friendJoinList.Items[i] as FriendRosterItem;
+                if (item == null) continue;
+                if (item.Session != null) onlineCount++;
+                if (selectedIndex < 0 && !string.IsNullOrWhiteSpace(previouslySelected) &&
+                    string.Equals(item.Name, previouslySelected, StringComparison.OrdinalIgnoreCase)) selectedIndex = i;
+                if (firstJoinable < 0 && IsFriendSessionJoinable(item.Session)) firstJoinable = i;
+            }
+            if (selectedIndex < 0) selectedIndex = firstJoinable;
+            if (selectedIndex < 0 && friendJoinList.Items.Count > 0) selectedIndex = 0;
+            if (selectedIndex >= 0) friendJoinList.SelectedIndex = selectedIndex;
+
+            if (names.Count == 0)
+                friendJoinStatusLabel.Text = "Add friends in Group...";
+            else if (onlineCount == 0)
+                friendJoinStatusLabel.Text = "No friends hosting";
+            else if (!string.IsNullOrWhiteSpace(loadedFriendName) && selectedFriendSession != null)
+                friendJoinStatusLabel.Text = "Loaded " + loadedFriendName +
+                    (LoadedFriendRouteText() + " • press Join");
+            else
+                friendJoinStatusLabel.Text = onlineCount.ToString() +
+                    (onlineCount == 1 ? " friend hosting" : " friends hosting") +
+                    " • select one to load";
+
+            UpdateFriendRouteUi();
+            UpdateGameState();
+            friendJoinList.Invalidate();
+        }
+
+        private void UpdateSelectedFriendFromRoster()
+        {
+            FriendRosterItem item = friendJoinList.SelectedItem as FriendRosterItem;
+            if (item == null) return;
+
+            if (item.Session == null)
+                friendJoinStatusLabel.Text = item.Name + " is offline";
+            else if (item.Session.InGame)
+                friendJoinStatusLabel.Text = item.Name + " is already in game";
+            else if (FriendVersionMismatch(item.Session))
+                friendJoinStatusLabel.Text = item.Name + " • Dolphin version mismatch";
+            else if (string.Equals(loadedFriendName, item.Name, StringComparison.OrdinalIgnoreCase) &&
+                selectedFriendSession != null)
+                friendJoinStatusLabel.Text = "Loaded " + item.Name +
+                    (LoadedFriendRouteText() + " • press Join");
+            else
+                friendJoinStatusLabel.Text = "Select to load " + item.Name;
+
+            friendJoinList.Invalidate();
+        }
+
+        private void LoadSelectedFriendFromMain()
+        {
+            FriendRosterItem item = friendJoinList.SelectedItem as FriendRosterItem;
+            if (item == null) return;
+
+            if (item.Session == null)
+            {
+                friendJoinStatusLabel.Text = item.Name + " is offline";
+                return;
+            }
+            if (item.Session.InGame)
+            {
+                friendJoinStatusLabel.Text = item.Name + " is already in game";
+                return;
+            }
+            if (FriendVersionMismatch(item.Session))
+            {
+                friendJoinStatusLabel.Text = item.Name + " • Dolphin version mismatch";
+                return;
+            }
+            if (!IsFriendSessionJoinable(item.Session))
+            {
+                friendJoinStatusLabel.Text = "That friend session is not ready to load";
+                return;
+            }
+
+            loadedFriendName = item.Name;
+            selectedFriendSession = item.Session;
+            ApplyLoadedFriendLanOverride(item.Name, true);
+            DiagnosticsLog.Write("FRIENDS", loadedFriendUseLan && !string.IsNullOrWhiteSpace(loadedFriendLanAddress)
+                ? "Main-window friend loaded with LAN Direct default; target redacted."
+                : "Main-window friend loaded for Internet Join; target redacted.");
+            friendJoinStatusLabel.Text = "Loaded " + item.Name +
+                (LoadedFriendRouteText() + " • press Join");
+            UpdateFriendRouteUi();
+            UpdateGameState();
+            friendJoinList.Invalidate();
+            if (goButton.Enabled)
+            {
+                goButton.Focus();
+                NotifyControllerFocusSettled();
+            }
+        }
+
+        private Dictionary<string, FriendLanEndpoint> GetFriendLanOverrideCache()
+        {
+            string raw = settings != null ? (settings.FriendLanOverrides ?? "") : "";
+            if (!string.Equals(raw, friendLanOverrideCacheRaw, StringComparison.Ordinal))
+            {
+                friendLanOverrideCache = FriendLanOverrideCodec.Parse(raw);
+                friendLanOverrideCacheRaw = raw;
+            }
+            return friendLanOverrideCache;
+        }
+
+        private void ApplyLoadedFriendLanOverride(string friendName, bool resetPreference)
+        {
+            bool previousPreference = loadedFriendUseLan;
+            loadedFriendLanAddress = "";
+            loadedFriendLanPort = 0;
+            if (string.IsNullOrWhiteSpace(friendName))
+            {
+                loadedFriendUseLan = false;
+                return;
+            }
+
+            FriendLanEndpoint endpoint;
+            if (!GetFriendLanOverrideCache().TryGetValue(friendName.Trim(), out endpoint) || endpoint == null)
+            {
+                loadedFriendUseLan = false;
+                return;
+            }
+
+            loadedFriendLanAddress = endpoint.Address ?? "";
+            loadedFriendLanPort = endpoint.Port >= 1 && endpoint.Port <= 65535 ? endpoint.Port : 2626;
+            loadedFriendUseLan = resetPreference ? !string.IsNullOrWhiteSpace(loadedFriendLanAddress) : previousPreference;
+            if (string.IsNullOrWhiteSpace(loadedFriendLanAddress)) loadedFriendUseLan = false;
+        }
+
+        private string LoadedFriendRouteText()
+        {
+            if (string.IsNullOrWhiteSpace(loadedFriendLanAddress)) return "";
+            return loadedFriendUseLan ? " • LAN direct" : " • Internet";
+        }
+
+        private void UpdateFriendRouteUi()
+        {
+            bool available = !string.IsNullOrWhiteSpace(loadedFriendName) &&
+                selectedFriendSession != null && !string.IsNullOrWhiteSpace(loadedFriendLanAddress);
+            friendRouteButton.Visible = available;
+            friendJoinStatusLabel.Visible = !available;
+            if (available)
+            {
+                friendRouteButton.Text = loadedFriendName + (loadedFriendUseLan ? ": LAN" : ": Internet");
+                friendRouteButton.Enabled = true;
+            }
+        }
+
+        private void ToggleLoadedFriendRoute()
+        {
+            if (string.IsNullOrWhiteSpace(loadedFriendLanAddress) || selectedFriendSession == null) return;
+            loadedFriendUseLan = !loadedFriendUseLan;
+            DiagnosticsLog.Write("FRIENDS", loadedFriendUseLan
+                ? "Loaded Friend route changed to saved LAN Direct endpoint; target redacted."
+                : "Loaded Friend route changed to Internet/advertised lobby endpoint; target redacted.");
+            UpdateFriendRouteUi();
+            UpdateGameState();
+            friendJoinList.Invalidate();
+        }
+
+        private bool HasFriendLanOverride(string friendName)
+        {
+            if (string.IsNullOrWhiteSpace(friendName)) return false;
+            FriendLanEndpoint endpoint;
+            return GetFriendLanOverrideCache().TryGetValue(friendName.Trim(), out endpoint) && endpoint != null;
+        }
+
+        private void ClearFriendCustomBadgeCache()
+        {
+            foreach (Image image in friendCustomBadgeImages.Values)
+            {
+                if (image == null) continue;
+                try { image.Dispose(); } catch { }
+            }
+            friendCustomBadgeImages.Clear();
+        }
+
+        private Image GetFriendCustomBadgeImage(string friendName)
+        {
+            if (string.IsNullOrWhiteSpace(friendName)) return null;
+            Image cached;
+            if (friendCustomBadgeImages.TryGetValue(friendName, out cached)) return cached;
+
+            string path = FriendBadgeStore.GetPath(friendName);
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            {
+                friendCustomBadgeImages[friendName] = null;
+                return null;
+            }
+
+            try
+            {
+                using (Image source = Image.FromFile(path))
+                    cached = new Bitmap(source);
+                friendCustomBadgeImages[friendName] = cached;
+                return cached;
+            }
+            catch
+            {
+                friendCustomBadgeImages[friendName] = null;
+                return null;
+            }
+        }
+
+        private static Color GetFriendBadgeColor(string name)
+        {
+            Color[] palette = new Color[]
+            {
+                Color.FromArgb(65, 145, 245),
+                Color.FromArgb(135, 90, 220),
+                Color.FromArgb(30, 165, 140),
+                Color.FromArgb(225, 115, 55),
+                Color.FromArgb(200, 70, 125),
+                Color.FromArgb(75, 155, 80)
+            };
+            int hash = 17;
+            foreach (char c in (name ?? "")) hash = unchecked(hash * 31 + char.ToUpperInvariant(c));
+            if (hash == int.MinValue) hash = 0;
+            return palette[Math.Abs(hash) % palette.Length];
+        }
+
+        private static string GetFriendBadgeText(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "?";
+            string[] parts = name.Trim().Split(new char[] { ' ', '_', '-' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2)
+                return (parts[0].Substring(0, 1) + parts[1].Substring(0, 1)).ToUpperInvariant();
+            string one = parts.Length == 1 ? parts[0] : name.Trim();
+            return one.Substring(0, Math.Min(2, one.Length)).ToUpperInvariant();
+        }
+
+        private void DrawFriendJoinItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= friendJoinList.Items.Count) return;
+            FriendRosterItem item = friendJoinList.Items[e.Index] as FriendRosterItem;
+            if (item == null) return;
+
+            bool selected = (e.State & DrawItemState.Selected) != 0;
+            Color back = selected ? AppTheme.ThemeSelected(settings) : AppTheme.Field(settings);
+            Color fore = AppTheme.Fore(settings);
+            Color dim = AppTheme.IsDark(settings) ? Color.FromArgb(175, 181, 193) : Color.FromArgb(100, 105, 115);
+            if (selected && AccentVisuals.Animated(settings))
+            {
+                using (LinearGradientBrush b = AccentVisuals.CreateGradient(e.Bounds, 255))
+                    e.Graphics.FillRectangle(b, e.Bounds);
+                fore = Color.White;
+                dim = Color.FromArgb(234, 238, 246);
+            }
+            else
+            {
+                using (SolidBrush b = new SolidBrush(back)) e.Graphics.FillRectangle(b, e.Bounds);
+            }
+
+            bool loaded = !string.IsNullOrWhiteSpace(loadedFriendName) &&
+                string.Equals(loadedFriendName, item.Name, StringComparison.OrdinalIgnoreCase);
+            bool mismatch = item.Session != null && FriendVersionMismatch(item.Session);
+            string state = item.Session == null ? "Offline"
+                : (item.Session.InGame ? "In game" : (mismatch ? "Version mismatch" : (loaded ? "Loaded" : "Ready")));
+            if (item.Session != null && !item.Session.InGame && !mismatch && HasFriendLanOverride(item.Name))
+            {
+                if (loaded) state += loadedFriendUseLan ? " • LAN" : " • Internet";
+                else state += " • LAN default";
+            }
+
+            if (friendRosterBoldFont == null)
+                friendRosterBoldFont = new Font(friendJoinList.Font, FontStyle.Bold);
+            if (friendRosterBadgeFont == null)
+                friendRosterBadgeFont = new Font(friendJoinList.Font.FontFamily, 6.5F, FontStyle.Bold);
+
+            bool bannerMode = settings != null && string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase);
+            bool showBadges = settings == null || settings.FriendShowBadges;
+            int textLeft = e.Bounds.X + 5;
+
+            if (showBadges)
+            {
+                int badgeSize = bannerMode ? 26 : 18;
+                int badgeY = e.Bounds.Y + Math.Max(2, (e.Bounds.Height - badgeSize) / 2);
+                Rectangle badge = new Rectangle(e.Bounds.X + 5, badgeY, badgeSize, badgeSize);
+                Image customBadge = GetFriendCustomBadgeImage(item.Name);
+                if (customBadge != null)
+                    e.Graphics.DrawImage(customBadge, badge);
+                else
+                {
+                    Color badgeColor = item.Session == null ? dim : GetFriendBadgeColor(item.Name);
+                    using (SolidBrush bb = new SolidBrush(badgeColor)) e.Graphics.FillEllipse(bb, badge);
+                    TextRenderer.DrawText(e.Graphics, GetFriendBadgeText(item.Name), friendRosterBadgeFont, badge, Color.White,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                }
+                textLeft = badge.Right + 6;
+            }
+
+            Image banner = bannerMode && item.Session != null && sessionBannerCatalog != null
+                ? sessionBannerCatalog.GetCached(item.Session.Game) : null;
+            int bannerWidth = banner != null ? 72 : 0;
+            if (banner != null)
+            {
+                Rectangle bannerRect = new Rectangle(e.Bounds.Right - 77, e.Bounds.Y + 6, 72, 24);
+                e.Graphics.DrawImage(banner, bannerRect);
+                using (Pen bp = new Pen(Color.FromArgb(105, AppTheme.Border(settings))))
+                    e.Graphics.DrawRectangle(bp, bannerRect.X, bannerRect.Y, bannerRect.Width - 1, bannerRect.Height - 1);
+            }
+
+            int textRight = e.Bounds.Right - 6 - (bannerWidth > 0 ? bannerWidth + 8 : 0);
+            int textWidth = Math.Max(30, textRight - textLeft);
+            if (bannerMode)
+            {
+                Rectangle topRect = new Rectangle(textLeft, e.Bounds.Y + 2, textWidth, 16);
+                Rectangle bottomRect = new Rectangle(textLeft, e.Bounds.Y + 18, textWidth, 15);
+                string nameText = (loaded ? "✓ " : "") + item.Name + " • " + state;
+                string gameText = "";
+                if (item.Session != null)
+                {
+                    SessionGamePresentation info = SessionBannerCatalog.ParseGame(item.Session.Game);
+                    gameText = string.IsNullOrWhiteSpace(info.Title) ? "Unknown game" : info.Title;
+                    if (!string.IsNullOrWhiteSpace(info.MetadataText)) gameText += " • " + info.MetadataText;
+                }
+                TextRenderer.DrawText(e.Graphics, nameText, item.Session != null ? friendRosterBoldFont : friendJoinList.Font, topRect,
+                    item.Session != null ? fore : dim, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(e.Graphics, gameText, friendJoinList.Font, bottomRect, dim,
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+            else
+            {
+                string text;
+                if (item.Session == null) text = item.Name + " — Offline";
+                else
+                {
+                    string game = string.IsNullOrWhiteSpace(item.Session.Game) ? "Unknown game" : item.Session.Game;
+                    text = (loaded ? "✓ " : "") + item.Name + " — " + game + " — " + state;
+                }
+                Rectangle rect = new Rectangle(textLeft, e.Bounds.Y + 3, textWidth, e.Bounds.Height - 5);
+                TextRenderer.DrawText(e.Graphics, text, item.Session != null ? friendRosterBoldFont : friendJoinList.Font, rect,
+                    item.Session != null ? fore : dim,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+
+            using (Pen p = new Pen(AppTheme.Border(settings)))
+                e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            e.DrawFocusRectangle();
+        }
+
+        private void ApplyNetPlayGameDisplayLayout()
+        {
+            bool banners = settings != null && string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase);
+            friendJoinList.ItemHeight = banners ? 36 : 26;
+            friendJoinList.Invalidate();
+            ApplyResponsiveMainLayout();
+
+            if (banners && sessionBannerCatalog != null)
+            {
+                // Manual override files may have been added since the previous refresh.
+                // Let the next background refresh retry keys that previously had no art.
+                sessionBannerCatalog.ClearMissingForManualOverrides();
+            }
+        }
+
+        // Vertical resizing has an explicit layout policy instead of
+        // relying on a mixture of fixed top coordinates and Bottom anchors. Friends
+        // consumes available height with its roster. Host and Traversal/Direct keep
+        // fixed-size controls, so center that active block in the space between the
+        // top selectors and the bottom Dolphin card. This preserves the accepted
+        // opaque/card rendering architecture while avoiding the giant empty gulf seen
+        // in earlier resize testing.
+        private void ApplyResponsiveMainLayout()
+        {
+            if (mainPanel == null || mainPanel.IsDisposed || dolphinGroup == null || dolphinGroup.IsDisposed)
+                return;
+
+            const int sideTopGap = 10;
+            int dolphinTop = dolphinGroup.Top;
+            if (dolphinTop <= 0) return;
+
+            bool join = joinRadio.Checked;
+            bool friendsMode = join && friendRadio.Visible && friendRadio.Checked;
+            bool banners = settings != null &&
+                string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase);
+
+            if (friendsMode)
+            {
+                int top = connectionSelectorPanel.Bottom + 2;
+                int bottom = dolphinTop - sideTopGap;
+                int minHeight = banners ? 130 : 114;
+                friendJoinGroup.Top = top;
+                friendJoinGroup.Height = Math.Max(minHeight, bottom - top);
+                friendJoinList.Height = Math.Max(banners ? 72 : 56,
+                    friendJoinGroup.ClientSize.Height - friendJoinList.Top - 9);
+                return;
+            }
+
+            if (!join)
+            {
+                int availableTop = nickBox.Bottom + 12;
+                int availableBottom = dolphinTop - sideTopGap;
+                int room = Math.Max(0, availableBottom - availableTop - publicHostGroup.Height);
+                publicHostGroup.Top = availableTop + (room / 2);
+                return;
+            }
+
+            // Traversal/Direct use the same input row. Direct adds the port row.
+            int targetAreaTop = connectionSelectorPanel.Bottom + 12;
+            int targetAreaBottom = dolphinTop - sideTopGap;
+            int blockHeight = directRadio.Checked ? 66 : 28;
+            int targetRoom = Math.Max(0, targetAreaBottom - targetAreaTop - blockHeight);
+            int targetTop = targetAreaTop + (targetRoom / 2);
+
+            targetBox.Top = targetTop;
+            targetLabel.Top = targetTop + 4;
+            pasteButton.Top = targetTop - 1;
+            portBox.Top = targetTop + 42;
+            portLabel.Top = targetTop + 46;
+        }
+
+        private void UpdateJoinConnectionSelectorLayout()
+        {
+            bool showFriends = settings != null && settings.FriendGroupEnabled;
+            friendRadio.Visible = showFriends;
+            if (showFriends)
+            {
+                traversalRadio.Location = new Point(6, 6);
+                traversalRadio.Size = new Size(170, 36);
+                traversalRadio.TabIndex = 0;
+                friendRadio.Location = new Point(184, 6);
+                friendRadio.Size = new Size(170, 36);
+                friendRadio.TabIndex = 1;
+                directRadio.Location = new Point(362, 6);
+                directRadio.Size = new Size(172, 36);
+                directRadio.TabIndex = 2;
+            }
+            else
+            {
+                if (friendRadio.Checked) traversalRadio.Checked = true;
+                traversalRadio.Location = new Point(6, 6);
+                traversalRadio.Size = new Size(260, 36);
+                traversalRadio.TabIndex = 0;
+                directRadio.Location = new Point(274, 6);
+                directRadio.Size = new Size(260, 36);
+                directRadio.TabIndex = 1;
+            }
+            UpdateSelectorVisuals();
+            ApplyResponsiveMainLayout();
+        }
+
+        private void SwitchJoinModeToFriends()
+        {
+            UpdateSelectorVisuals();
+            selectedFriendSession = null;
+            loadedFriendName = "";
+            loadedFriendLanAddress = "";
+            loadedFriendLanPort = 0;
+            loadedFriendUseLan = false;
+            UpdateFriendRouteUi();
+            PopulateFriendJoinList();
+            if (joinRadio.Checked) BeginFriendRefresh(false);
+            UpdateMainMode();
         }
 
         private static int GetDirectAddressMaxLength(string value)
@@ -13088,6 +16242,12 @@ namespace DolphinNetPlayLauncher
 
         private void SwitchJoinMode(JoinConnection next)
         {
+            selectedFriendSession = null;
+            loadedFriendName = "";
+            loadedFriendLanAddress = "";
+            loadedFriendLanPort = 0;
+            loadedFriendUseLan = false;
+            UpdateFriendRouteUi();
             UpdateSelectorVisuals();
             if (previousJoinConnection == JoinConnection.Traversal)
                 traversalValue = ClampTargetText(targetBox.Text, TraversalRoomCodeMaxLength);
@@ -13114,6 +16274,7 @@ namespace DolphinNetPlayLauncher
                 portBox.Visible = false;
             }
             targetBox.SelectionStart = targetBox.Text.Length;
+            UpdateMainMode();
             UpdateGameState();
         }
 
@@ -13150,6 +16311,274 @@ namespace DolphinNetPlayLauncher
         }
     }
 
+    internal sealed class FriendGroupProfile
+    {
+        public string GroupName = "Friends";
+        public string Region = "NA";
+        public string Password = "";
+        public readonly List<string> Members = new List<string>();
+        // Optional normalized custom badges travel with .dnlgroup profiles.
+        public readonly Dictionary<string, string> Badges =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal static class FriendGroupProfileFile
+    {
+        private const string Header = "DolphinNetPlayLauncherFriendGroup";
+        private const string FormatVersion = "2";
+
+        internal static FriendGroupProfile Create(string groupName, string password, string region, string myName, string friendNames)
+        {
+            FriendGroupProfile profile = new FriendGroupProfile();
+            profile.GroupName = Program.RemoveUnsafeIniCharacters(groupName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(profile.GroupName)) profile.GroupName = "Friends";
+            profile.Region = Program.NormalizeFriendRegion(region);
+            profile.Password = Program.RemoveUnsafeIniCharacters(password ?? "");
+
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Action<string> add = delegate(string raw)
+            {
+                string value = Program.RemoveUnsafeIniCharacters(raw ?? "").Trim();
+                if (value.Length > 0 && seen.Add(value)) profile.Members.Add(value);
+            };
+            add(myName);
+            string normalized = (friendNames ?? "").Replace("\r", "\n");
+            foreach (string part in normalized.Split(new char[] { '\n', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                add(part);
+
+            foreach (string member in profile.Members)
+            {
+                string badge;
+                if (FriendBadgeStore.TryReadBase64(member, out badge))
+                    profile.Badges[member] = badge;
+            }
+            return profile;
+        }
+
+        internal static string BuildFriendListExcluding(FriendGroupProfile profile, string self)
+        {
+            if (profile == null) return "";
+            List<string> names = new List<string>();
+            foreach (string member in profile.Members)
+            {
+                if (string.Equals(member, self, StringComparison.OrdinalIgnoreCase)) continue;
+                names.Add(member);
+            }
+            return string.Join(Environment.NewLine, names.ToArray());
+        }
+
+        internal static void ApplyToSettings(DnlSettings settings, FriendGroupProfile profile, string self)
+        {
+            if (settings == null || profile == null) return;
+            settings.FriendGroupEnabled = true;
+            settings.FriendGroupName = profile.GroupName;
+            settings.FriendGroupPassword = profile.Password;
+            settings.FriendRegion = Program.NormalizeFriendRegion(profile.Region);
+            settings.FriendMySessionName = Program.RemoveUnsafeIniCharacters(self ?? "").Trim();
+            settings.FriendNames = BuildFriendListExcluding(profile, settings.FriendMySessionName);
+            settings.FriendAutoHost = true;
+        }
+
+        internal static bool TrySave(string path, FriendGroupProfile profile, out string error)
+        {
+            error = "";
+            try
+            {
+                if (profile == null) { error = "Friend Group profile is empty."; return false; }
+                List<string> lines = new List<string>();
+                lines.Add("# Dolphin NetPlay Launcher Friend Group");
+                lines.Add("# This file contains the shared group password. Share only with intended members.");
+                lines.Add("Type=" + Header);
+                lines.Add("Format=" + FormatVersion);
+                lines.Add("GroupNameB64=" + Program.EncodeSettingsText(profile.GroupName ?? "Friends"));
+                lines.Add("Region=" + Program.NormalizeFriendRegion(profile.Region));
+                lines.Add("PasswordB64=" + Program.EncodeSettingsText(profile.Password ?? ""));
+                lines.Add("MembersB64=" + Program.EncodeSettingsText(string.Join("\n", profile.Members.ToArray())));
+                if (profile.Badges != null && profile.Badges.Count > 0)
+                {
+                    JavaScriptSerializer badgeSerializer = new JavaScriptSerializer();
+                    lines.Add("BadgesJsonB64=" + Program.EncodeSettingsText(badgeSerializer.Serialize(profile.Badges)));
+                }
+                File.WriteAllLines(path, lines.ToArray(), new UTF8Encoding(false));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "Could not export Friend Group profile:\n" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static bool TryLoad(string path, out FriendGroupProfile profile, out string error)
+        {
+            profile = null;
+            error = "";
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                {
+                    error = "Friend Group profile was not found.";
+                    return false;
+                }
+                Dictionary<string, string> values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string line = (raw ?? "").Trim();
+                    if (line.Length == 0 || line.StartsWith("#")) continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    values[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+                string type;
+                if (!values.TryGetValue("Type", out type) || !string.Equals(type, Header, StringComparison.Ordinal))
+                {
+                    error = "This is not a Dolphin NetPlay Launcher Friend Group profile.";
+                    return false;
+                }
+                string format;
+                if (!values.TryGetValue("Format", out format) || (format != "1" && format != FormatVersion))
+                {
+                    error = "This Friend Group profile uses an unsupported format version.";
+                    return false;
+                }
+
+                FriendGroupProfile loaded = new FriendGroupProfile();
+                string value;
+                if (values.TryGetValue("GroupNameB64", out value)) loaded.GroupName = Program.DecodeSettingsText(value);
+                if (string.IsNullOrWhiteSpace(loaded.GroupName)) loaded.GroupName = "Friends";
+                if (values.TryGetValue("Region", out value)) loaded.Region = Program.NormalizeFriendRegion(value);
+                if (values.TryGetValue("PasswordB64", out value)) loaded.Password = Program.DecodeSettingsText(value);
+                string members = values.TryGetValue("MembersB64", out value) ? Program.DecodeSettingsText(value) : "";
+
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string part in members.Replace("\r", "\n").Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string member = Program.RemoveUnsafeIniCharacters(part).Trim();
+                    if (member.Length > 0 && seen.Add(member)) loaded.Members.Add(member);
+                }
+                if (format == "2" && values.TryGetValue("BadgesJsonB64", out value) && !string.IsNullOrWhiteSpace(value))
+                {
+                    try
+                    {
+                        JavaScriptSerializer badgeSerializer = new JavaScriptSerializer();
+                        Dictionary<string, string> badges = badgeSerializer.Deserialize<Dictionary<string, string>>(Program.DecodeSettingsText(value));
+                        if (badges != null)
+                        {
+                            HashSet<string> memberSet = new HashSet<string>(loaded.Members, StringComparer.OrdinalIgnoreCase);
+                            foreach (KeyValuePair<string, string> pair in badges)
+                            {
+                                string member = Program.RemoveUnsafeIniCharacters(pair.Key ?? "").Trim();
+                                if (member.Length == 0 || !memberSet.Contains(member) || string.IsNullOrWhiteSpace(pair.Value)) continue;
+                                byte[] bytes = Convert.FromBase64String(pair.Value);
+                                if (bytes.Length == 0 || bytes.Length > 256 * 1024) continue;
+                                loaded.Badges[member] = pair.Value;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                if (loaded.Members.Count == 0)
+                {
+                    error = "This Friend Group profile does not contain any member session names.";
+                    return false;
+                }
+                if (string.IsNullOrWhiteSpace(loaded.Password))
+                {
+                    error = "This Friend Group profile does not contain a shared password.";
+                    return false;
+                }
+                profile = loaded;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "Could not import Friend Group profile:\n" + ex.Message;
+                return false;
+            }
+        }
+
+        internal static string MakeSafeFileName(string value)
+        {
+            string name = string.IsNullOrWhiteSpace(value) ? "Friend-Group" : value.Trim();
+            foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '-');
+            return name;
+        }
+    }
+
+    internal sealed class FriendGroupIdentityForm : Form
+    {
+        private readonly ComboBox memberBox = new ComboBox();
+        public string SelectedMember { get { return memberBox.SelectedItem != null ? memberBox.SelectedItem.ToString() : ""; } }
+
+        private FriendGroupIdentityForm(DnlSettings settings, FriendGroupProfile profile, string preferred)
+        {
+            Text = "Choose Your Friend Name";
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(420, 160);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+
+            Label label = new AdventureLabel();
+            label.Text = "Which member are you in '" + profile.GroupName + "'?";
+            label.Location = new Point(18, 20);
+            label.Size = new Size(380, 22);
+            Controls.Add(label);
+
+            Label help = new AdventureLabel();
+            help.Text = "This becomes your public Friend session name. Everyone else is added to your Friends list.";
+            help.Location = new Point(18, 47);
+            help.Size = new Size(380, 38);
+            help.ForeColor = Color.DimGray;
+            Controls.Add(help);
+
+            memberBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            memberBox.Location = new Point(18, 88);
+            memberBox.Size = new Size(250, 24);
+            foreach (string member in profile.Members) memberBox.Items.Add(member);
+            int selected = 0;
+            for (int i = 0; i < memberBox.Items.Count; i++)
+                if (string.Equals(memberBox.Items[i].ToString(), preferred, StringComparison.OrdinalIgnoreCase)) { selected = i; break; }
+            if (memberBox.Items.Count > 0) memberBox.SelectedIndex = selected;
+            Controls.Add(memberBox);
+
+            Button ok = new AdventureButton();
+            ok.Text = "Use This Name";
+            ok.Location = new Point(278, 87);
+            ok.Size = new Size(122, 28);
+            ok.DialogResult = DialogResult.OK;
+            Controls.Add(ok);
+            AcceptButton = ok;
+
+            Button cancel = new AdventureButton();
+            cancel.Text = "Cancel";
+            cancel.Location = new Point(325, 124);
+            cancel.Size = new Size(75, 26);
+            cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancel);
+            CancelButton = cancel;
+
+            AppTheme.Apply(this, settings);
+            AppFonts.Apply(this, settings);
+            UiSoundManager.AttachMouseInteractionSounds(this, settings);
+        }
+
+        internal static string ChooseIdentity(IWin32Window owner, DnlSettings settings, FriendGroupProfile profile, string preferred)
+        {
+            if (profile == null || profile.Members.Count == 0) return "";
+            string candidate = preferred;
+            if (string.IsNullOrWhiteSpace(candidate) && settings != null) candidate = settings.FriendMySessionName;
+            // Importing a shared profile is an identity-changing action. Even if
+            // this PC already has a matching Friend name, always show the chooser and
+            // merely preselect that match. Earlier behavior silently accepted it, which made an
+            // import look as if the identity question had been skipped.
+            using (FriendGroupIdentityForm form = new FriendGroupIdentityForm(settings, profile, candidate ?? ""))
+                return form.ShowDialog(owner) == DialogResult.OK ? form.SelectedMember : "";
+        }
+    }
+
     internal sealed class OptionsForm : Form
     {
         private readonly DnlSettings settings;
@@ -13169,6 +16598,7 @@ namespace DolphinNetPlayLauncher
         private readonly CheckBox interfaceSoundsBox = new CheckBox();
         private readonly ComboBox soundStyleBox = new ComboBox();
         private readonly ComboBox libraryViewBox = new ComboBox();
+        private readonly ComboBox netPlayGameDisplayBox = new ComboBox();
         private readonly NumericUpDown libraryColumnsOptionBox = new NumericUpDown();
         private readonly CheckBox autoCloseBox = new CheckBox();
         private readonly NumericUpDown graceBox = new NumericUpDown();
@@ -13193,11 +16623,34 @@ namespace DolphinNetPlayLauncher
         private readonly CheckBox highlightAutoBox = new CheckBox();
         private readonly NumericUpDown highlightHzBox = new NumericUpDown();
         private readonly Label detectedRefreshLabel = new AdventureLabel();
+
+        private readonly CheckBox friendGroupEnabledBox = new CheckBox();
+        private readonly ComboBox friendGroupListBox = new ComboBox();
+        private readonly TextBox friendGroupNameBox = new TextBox();
+        private readonly TextBox friendMySessionNameBox = new TextBox();
+        private readonly TextBox friendGroupPasswordBox = new TextBox();
+        private readonly TextBox friendNamesBox = new TextBox();
+        private readonly ComboBox friendRegionBox = new ComboBox();
+        private readonly CheckBox friendAutoHostBox = new CheckBox();
+        private readonly CheckBox friendShowBadgesBox = new CheckBox();
+        private readonly ComboBox friendBadgeMemberBox = new ComboBox();
+        // Backing text for per-PC LAN overrides. The UI no longer exposes the raw
+        // name=address:port syntax in Options; structured controls below edit it.
+        private readonly TextBox friendLanOverridesBox = new TextBox();
+        private readonly ComboBox friendLanMemberBox = new ComboBox();
+        private readonly TextBox friendLanAddressBox = new TextBox();
+        private readonly NumericUpDown friendLanPortBox = new NumericUpDown();
+        private readonly Label friendLanStatusLabel = new AdventureLabel();
+        private List<FriendGroupEntry> friendGroupEntries = new List<FriendGroupEntry>();
+        private string friendEditingGroupId = "";
+        private bool friendGroupListUpdating;
+        private bool terminalDialogSoundPlayed;
+
         private readonly System.Windows.Forms.Timer controllerUiTimer = new System.Windows.Forms.Timer();
 
         public bool SettingsImportRequested { get; private set; }
 
-        public OptionsForm(DnlSettings settings, DolphinPaths paths, string romPath, string dolphinVersion, string updateTrack, SdlControllerManager controllerManager)
+        public OptionsForm(DnlSettings settings, DolphinPaths paths, string romPath, string dolphinVersion, string updateTrack, SdlControllerManager controllerManager, bool openFriendsTab)
         {
             this.settings = settings;
             this.paths = paths;
@@ -13233,6 +16686,7 @@ namespace DolphinNetPlayLauncher
             TabPage appearance = new TabPage("Appearance");
             TabPage controller = new TabPage("Controller");
             TabPage library = new TabPage("Library");
+            TabPage friends = new TabPage("Friends");
             TabPage dolphin = new TabPage("Dolphin");
             TabPage diagnostics = new TabPage("Diagnostics");
             TabPage aboutPage = new TabPage("About");
@@ -13240,6 +16694,7 @@ namespace DolphinNetPlayLauncher
             tabs.TabPages.Add(appearance);
             tabs.TabPages.Add(controller);
             tabs.TabPages.Add(library);
+            tabs.TabPages.Add(friends);
             tabs.TabPages.Add(dolphin);
             tabs.TabPages.Add(diagnostics);
             tabs.TabPages.Add(aboutPage);
@@ -13248,9 +16703,13 @@ namespace DolphinNetPlayLauncher
             BuildAppearanceTab(appearance);
             BuildControllerTab(controller);
             BuildLibraryOptionsTab(library);
+            BuildFriendsTab(friends);
             BuildDolphinTab(dolphin);
             BuildDiagnosticsTab(diagnostics);
             BuildAboutTab(aboutPage);
+
+            if (openFriendsTab)
+                tabs.SelectedTab = friends;
 
             ControllerNavigation.Attach(this, controllerManager, settings, tabs);
 
@@ -13260,7 +16719,10 @@ namespace DolphinNetPlayLauncher
             ok.Size = new Size(75, 30);
             ok.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             ok.DialogResult = DialogResult.OK;
-            ok.Click += delegate { ApplySettings(); };
+            ok.Click += delegate
+            {
+                ApplySettings();
+            };
             Controls.Add(ok);
             AcceptButton = ok;
 
@@ -13432,11 +16894,11 @@ namespace DolphinNetPlayLauncher
                     libraryViewBox.SelectedItem = "Grid";
                     libraryColumnsOptionBox.Value = 3;
                     autoCloseBox.Checked = true;
-                    graceBox.Value = 2.0M;
+                    graceBox.Value = 1.0M;
                     updateGraceBox.Value = 1.0M;
                     warningBox.Checked = true;
-                    failedJoinReturnBox.Checked = false;
-                    returnAfterDolphinCloseBox.Checked = false;
+                    failedJoinReturnBox.Checked = true;
+                    returnAfterDolphinCloseBox.Checked = true;
                     rememberModeBox.Checked = false;
                     openLibraryStandaloneBox.Checked = false;
                     openLibrarySteamBox.Checked = false;
@@ -13450,6 +16912,13 @@ namespace DolphinNetPlayLauncher
                     highlightHzBox.Value = 60;
                     interfaceSoundsBox.Checked = true;
                     animatedThemeBackgroundBox.Checked = true;
+                    friendGroupEnabledBox.Checked = false;
+                    friendGroupEntries.Clear();
+                    FriendGroupEntry resetFriendGroup = FriendGroupCollectionCodec.CreateBlank("Friends");
+                    friendGroupEntries.Add(resetFriendGroup);
+                    friendEditingGroupId = resetFriendGroup.Id;
+                    RefreshFriendGroupOptionsSelector();
+                    LoadFriendGroupEntryIntoControls(resetFriendGroup);
                     RefreshSoundStyleChoices("ClassicUI");
                     if (controllerBox.Items.Count > 0) controllerBox.SelectedIndex = 0;
                 }
@@ -13568,6 +17037,776 @@ namespace DolphinNetPlayLauncher
         }
 
 
+
+        private void BuildFriendsTab(TabPage page)
+        {
+            page.AutoScroll = true;
+
+            InitializeFriendGroupEntriesForOptions();
+
+            GroupBox group = new AdventureGroupBox();
+            group.Text = "Friend Groups";
+            group.Location = new Point(18, 18);
+            group.Size = new Size(649, 244);
+            page.Controls.Add(group);
+
+            friendGroupEnabledBox.Text = "Enable Friend Groups";
+            friendGroupEnabledBox.Location = new Point(18, 28);
+            friendGroupEnabledBox.AutoSize = true;
+            friendGroupEnabledBox.Checked = settings.FriendGroupEnabled;
+            group.Controls.Add(friendGroupEnabledBox);
+
+            Label activeLabel = new AdventureLabel();
+            activeLabel.Text = "Active group:";
+            activeLabel.Location = new Point(18, 67);
+            activeLabel.AutoSize = true;
+            group.Controls.Add(activeLabel);
+
+            friendGroupListBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendGroupListBox.Location = new Point(112, 63);
+            friendGroupListBox.Size = new Size(250, 24);
+            friendGroupListBox.SelectedIndexChanged += delegate
+            {
+                if (!friendGroupListUpdating) SwitchFriendGroupEditorSelection();
+            };
+            group.Controls.Add(friendGroupListBox);
+            LauncherForm.EnableSoftRoundedEntry(friendGroupListBox);
+
+            Button newGroup = new AdventureButton();
+            newGroup.Text = "New";
+            newGroup.Location = new Point(374, 61);
+            newGroup.Size = new Size(74, 28);
+            newGroup.Click += delegate { CreateNewFriendGroupInOptions(); };
+            group.Controls.Add(newGroup);
+
+            Button deleteGroup = new AdventureButton();
+            deleteGroup.Text = "Delete";
+            deleteGroup.Location = new Point(456, 61);
+            deleteGroup.Size = new Size(74, 28);
+            deleteGroup.Click += delegate { DeleteFriendGroupInOptions(); };
+            group.Controls.Add(deleteGroup);
+
+            Label groupNameLabel = new AdventureLabel();
+            groupNameLabel.Text = "Group name:";
+            groupNameLabel.Location = new Point(18, 108);
+            groupNameLabel.AutoSize = true;
+            group.Controls.Add(groupNameLabel);
+
+            friendGroupNameBox.Location = new Point(112, 104);
+            friendGroupNameBox.Size = new Size(250, 24);
+            group.Controls.Add(friendGroupNameBox);
+            LauncherForm.EnableSoftRoundedEntry(friendGroupNameBox);
+
+            Label passwordLabel = new AdventureLabel();
+            passwordLabel.Text = "Shared password:";
+            passwordLabel.Location = new Point(18, 146);
+            passwordLabel.AutoSize = true;
+            group.Controls.Add(passwordLabel);
+
+            friendGroupPasswordBox.Location = new Point(130, 142);
+            friendGroupPasswordBox.Size = new Size(232, 24);
+            friendGroupPasswordBox.UseSystemPasswordChar = true;
+            group.Controls.Add(friendGroupPasswordBox);
+            LauncherForm.EnableSoftRoundedEntry(friendGroupPasswordBox);
+
+            Label security = new AdventureLabel();
+            security.Text = "All saved groups are local and DPAPI-protected. Portable settings exports omit Friend Group identity/secret data.";
+            security.Location = new Point(18, 180);
+            security.Size = new Size(600, 22);
+            security.ForeColor = Color.DimGray;
+            group.Controls.Add(security);
+
+            Label visibility = new AdventureLabel();
+            visibility.Text = "The selected group becomes active immediately after Options is accepted. Friend sessions still use Dolphin's public lobby.";
+            visibility.Location = new Point(18, 204);
+            visibility.Size = new Size(600, 32);
+            visibility.ForeColor = Color.DimGray;
+            group.Controls.Add(visibility);
+
+            GroupBox identity = new AdventureGroupBox();
+            identity.Text = "Active Group Identity & Matching";
+            identity.Location = new Point(18, 278);
+            identity.Size = new Size(649, 278);
+            page.Controls.Add(identity);
+
+            Label myNameLabel = new AdventureLabel();
+            myNameLabel.Text = "My session name:";
+            myNameLabel.Location = new Point(18, 31);
+            myNameLabel.AutoSize = true;
+            identity.Controls.Add(myNameLabel);
+
+            friendMySessionNameBox.Location = new Point(145, 27);
+            friendMySessionNameBox.Size = new Size(195, 24);
+            identity.Controls.Add(friendMySessionNameBox);
+            LauncherForm.EnableSoftRoundedEntry(friendMySessionNameBox);
+
+            Label regionLabel = new AdventureLabel();
+            regionLabel.Text = "Region:";
+            regionLabel.Location = new Point(365, 31);
+            regionLabel.AutoSize = true;
+            identity.Controls.Add(regionLabel);
+
+            friendRegionBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendRegionBox.Items.AddRange(new object[]
+            {
+                "East Asia (EA)", "China (CN)", "Europe (EU)", "North America (NA)",
+                "South America (SA)", "Oceania (OC)", "Africa (AF)"
+            });
+            friendRegionBox.Location = new Point(423, 27);
+            friendRegionBox.Size = new Size(190, 24);
+            identity.Controls.Add(friendRegionBox);
+            LauncherForm.EnableSoftRoundedEntry(friendRegionBox);
+
+            Label friendNamesLabel = new AdventureLabel();
+            friendNamesLabel.Text = "Other group members (one session name per line):";
+            friendNamesLabel.Location = new Point(18, 72);
+            friendNamesLabel.AutoSize = true;
+            identity.Controls.Add(friendNamesLabel);
+
+            friendNamesBox.Location = new Point(18, 96);
+            friendNamesBox.Size = new Size(595, 92);
+            friendNamesBox.Multiline = true;
+            friendNamesBox.AcceptsReturn = true;
+            friendNamesBox.KeyDown += delegate(object sender, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter && !e.Alt)
+                {
+                    friendNamesBox.SelectedText = Environment.NewLine;
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                }
+            };
+            friendNamesBox.ScrollBars = ScrollBars.Vertical;
+            identity.Controls.Add(friendNamesBox);
+            LauncherForm.EnableSoftRoundedEntry(friendNamesBox);
+
+            friendAutoHostBox.Text = "Use the active Friend Group by default when hosting";
+            friendAutoHostBox.Location = new Point(18, 203);
+            friendAutoHostBox.AutoSize = true;
+            identity.Controls.Add(friendAutoHostBox);
+
+            Label matchingHelp = new AdventureLabel();
+            matchingHelp.Text = "A lobby is marked Friend only when its saved name matches AND the group's shared password decrypts a plausible target.";
+            matchingHelp.Location = new Point(18, 233);
+            matchingHelp.Size = new Size(600, 38);
+            matchingHelp.ForeColor = Color.DimGray;
+            identity.Controls.Add(matchingHelp);
+
+            GroupBox sharing = new AdventureGroupBox();
+            sharing.Text = ".dnlgroup — Share a Ready-to-Use Friend Group";
+            sharing.Location = new Point(18, 571);
+            sharing.Size = new Size(649, 152);
+            page.Controls.Add(sharing);
+
+            Button importGroup = new AdventureButton();
+            importGroup.Text = "Import .dnlgroup...";
+            importGroup.Location = new Point(18, 28);
+            importGroup.Size = new Size(145, 30);
+            importGroup.Click += delegate { ImportFriendGroupProfileIntoOptions(); };
+            sharing.Controls.Add(importGroup);
+
+            Button exportGroup = new AdventureButton();
+            exportGroup.Text = "Export active group...";
+            exportGroup.Location = new Point(174, 28);
+            exportGroup.Size = new Size(155, 30);
+            exportGroup.Click += delegate { ExportFriendGroupProfileFromOptions(); };
+            sharing.Controls.Add(exportGroup);
+
+            Label shareHelp = new AdventureLabel();
+            shareHelp.Text =
+                "A .dnlgroup file packages the group name, region, member session names, and shared NetPlay password. " +
+                "Send one file to the group; each person imports or drags it onto the launcher, chooses who they are, and the group is added to their dropdown.";
+            shareHelp.Location = new Point(18, 68);
+            shareHelp.Size = new Size(605, 48);
+            shareHelp.ForeColor = Color.DimGray;
+            sharing.Controls.Add(shareHelp);
+
+            Label shareWarning = new AdventureLabel();
+            shareWarning.Text = "The shared password is portable, not encrypted for secrecy. Share .dnlgroup files only with the intended group.";
+            shareWarning.Location = new Point(18, 121);
+            shareWarning.Size = new Size(605, 22);
+            shareWarning.ForeColor = Color.DimGray;
+            sharing.Controls.Add(shareWarning);
+
+            GroupBox badges = new AdventureGroupBox();
+            badges.Text = "Friend badges";
+            badges.Location = new Point(18, 738);
+            badges.Size = new Size(649, 142);
+            page.Controls.Add(badges);
+
+            friendShowBadgesBox.Text = "Show personality badges in the Friends roster";
+            friendShowBadgesBox.Location = new Point(18, 27);
+            friendShowBadgesBox.AutoSize = true;
+            friendShowBadgesBox.Checked = settings.FriendShowBadges;
+            badges.Controls.Add(friendShowBadgesBox);
+
+            Label badgeMemberLabel = new AdventureLabel();
+            badgeMemberLabel.Text = "Member (you too):";
+            badgeMemberLabel.Location = new Point(18, 62);
+            badgeMemberLabel.AutoSize = true;
+            badges.Controls.Add(badgeMemberLabel);
+
+            friendBadgeMemberBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendBadgeMemberBox.Location = new Point(130, 58);
+            friendBadgeMemberBox.Size = new Size(175, 24);
+            friendBadgeMemberBox.DropDown += delegate { RefreshFriendBadgeMemberChoices(); };
+            badges.Controls.Add(friendBadgeMemberBox);
+            LauncherForm.EnableSoftRoundedEntry(friendBadgeMemberBox);
+
+            Button chooseBadge = new AdventureButton();
+            chooseBadge.Text = "Choose image...";
+            chooseBadge.Location = new Point(318, 56);
+            chooseBadge.Size = new Size(112, 28);
+            chooseBadge.Click += delegate { ChooseFriendBadgeImage(); };
+            badges.Controls.Add(chooseBadge);
+
+            Button pasteBadge = new AdventureButton();
+            pasteBadge.Text = "Paste image";
+            pasteBadge.Location = new Point(443, 56);
+            pasteBadge.Size = new Size(100, 28);
+            pasteBadge.Click += delegate { PasteFriendBadgeImage(); };
+            badges.Controls.Add(pasteBadge);
+
+            Button clearBadge = new AdventureButton();
+            clearBadge.Text = "Clear";
+            clearBadge.Location = new Point(553, 56);
+            clearBadge.Size = new Size(70, 28);
+            clearBadge.Click += delegate { ClearFriendBadgeImage(); };
+            badges.Controls.Add(clearBadge);
+
+            Label badgeHelp = new AdventureLabel();
+            badgeHelp.Text = "Choose yourself or another member, then choose/paste a profile picture (for example from Discord). " +
+                "Custom badges are normalized to 64x64 PNG and included in .dnlgroup exports.";
+            badgeHelp.Location = new Point(18, 94);
+            badgeHelp.Size = new Size(605, 38);
+            badgeHelp.ForeColor = Color.DimGray;
+            badges.Controls.Add(badgeHelp);
+
+            GroupBox lan = new AdventureGroupBox();
+            lan.Text = "Same-network / LAN connection — Active Group";
+            lan.Location = new Point(18, 895);
+            lan.Size = new Size(649, 216);
+            page.Controls.Add(lan);
+
+            Label lanHelp = new AdventureLabel();
+            lanHelp.Text = "Optional and local to this PC. Choose a Friend in the active group, then save the LAN address Dolphin should use for that Friend. Discovery still works normally; only the final Join route changes to Direct IP.";
+            lanHelp.Location = new Point(18, 26);
+            lanHelp.Size = new Size(605, 50);
+            lanHelp.ForeColor = Color.DimGray;
+            lan.Controls.Add(lanHelp);
+
+            Label lanMemberLabel = new AdventureLabel();
+            lanMemberLabel.Text = "Friend:";
+            lanMemberLabel.Location = new Point(18, 84);
+            lanMemberLabel.AutoSize = true;
+            lan.Controls.Add(lanMemberLabel);
+
+            friendLanMemberBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            friendLanMemberBox.Location = new Point(82, 80);
+            friendLanMemberBox.Size = new Size(218, 24);
+            friendLanMemberBox.DropDown += delegate { RefreshFriendLanMemberChoices(); };
+            friendLanMemberBox.SelectedIndexChanged += delegate { LoadFriendLanEditorSelection(); };
+            lan.Controls.Add(friendLanMemberBox);
+            LauncherForm.EnableSoftRoundedEntry(friendLanMemberBox);
+
+            Label lanAddressLabel = new AdventureLabel();
+            lanAddressLabel.Text = "Address / IP:";
+            lanAddressLabel.Location = new Point(18, 120);
+            lanAddressLabel.AutoSize = true;
+            lan.Controls.Add(lanAddressLabel);
+
+            friendLanAddressBox.Location = new Point(98, 116);
+            friendLanAddressBox.Size = new Size(244, 24);
+            lan.Controls.Add(friendLanAddressBox);
+            LauncherForm.EnableSoftRoundedEntry(friendLanAddressBox);
+
+            Label lanPortLabel = new AdventureLabel();
+            lanPortLabel.Text = "Port:";
+            lanPortLabel.Location = new Point(355, 120);
+            lanPortLabel.AutoSize = true;
+            lan.Controls.Add(lanPortLabel);
+
+            friendLanPortBox.Location = new Point(397, 116);
+            friendLanPortBox.Size = new Size(82, 24);
+            friendLanPortBox.Minimum = 1;
+            friendLanPortBox.Maximum = 65535;
+            friendLanPortBox.Value = 2626;
+            lan.Controls.Add(friendLanPortBox);
+
+            Button saveLan = new AdventureButton();
+            saveLan.Text = "Save";
+            saveLan.Location = new Point(493, 114);
+            saveLan.Size = new Size(58, 28);
+            saveLan.Click += delegate { SaveFriendLanOverrideFromOptions(); };
+            lan.Controls.Add(saveLan);
+
+            Button clearLan = new AdventureButton();
+            clearLan.Text = "Clear";
+            clearLan.Location = new Point(557, 114);
+            clearLan.Size = new Size(58, 28);
+            clearLan.Click += delegate { ClearFriendLanOverrideFromOptions(); };
+            lan.Controls.Add(clearLan);
+
+            friendLanStatusLabel.Location = new Point(18, 151);
+            friendLanStatusLabel.Size = new Size(595, 22);
+            friendLanStatusLabel.ForeColor = Color.DimGray;
+            friendLanStatusLabel.AutoEllipsis = true;
+            lan.Controls.Add(friendLanStatusLabel);
+
+            Label lanPrivacy = new AdventureLabel();
+            lanPrivacy.Text = "LAN addresses stay on this PC and with this local group entry. They are not included in .dnlgroup files or portable settings exports.";
+            lanPrivacy.Location = new Point(18, 181);
+            lanPrivacy.Size = new Size(605, 22);
+            lanPrivacy.ForeColor = Color.DimGray;
+            lan.Controls.Add(lanPrivacy);
+
+            friendNamesBox.TextChanged += delegate
+            {
+                RefreshFriendLanMemberChoices();
+                RefreshFriendBadgeMemberChoices();
+            };
+
+            RefreshFriendGroupOptionsSelector();
+            LoadFriendGroupEntryIntoControls(GetSelectedFriendGroupEntry());
+        }
+
+        private void InitializeFriendGroupEntriesForOptions()
+        {
+            friendGroupEntries = FriendGroupCollectionCodec.GetGroups(settings);
+            if (friendGroupEntries.Count == 0)
+            {
+                FriendGroupEntry blank = FriendGroupCollectionCodec.CreateBlank("Friends");
+                friendGroupEntries.Add(blank);
+                friendEditingGroupId = blank.Id;
+            }
+            else
+            {
+                FriendGroupEntry selected = FriendGroupCollectionCodec.FindById(friendGroupEntries, settings.FriendActiveGroupId) ?? friendGroupEntries[0];
+                friendEditingGroupId = selected.Id;
+            }
+        }
+
+        private FriendGroupEntry GetSelectedFriendGroupEntry()
+        {
+            FriendGroupEntry selected = FriendGroupCollectionCodec.FindById(friendGroupEntries, friendEditingGroupId);
+            return selected ?? (friendGroupEntries.Count > 0 ? friendGroupEntries[0] : null);
+        }
+
+        private void RefreshFriendGroupOptionsSelector()
+        {
+            friendGroupListUpdating = true;
+            try
+            {
+                friendGroupListBox.Items.Clear();
+                int selected = -1;
+                for (int i = 0; i < friendGroupEntries.Count; i++)
+                {
+                    FriendGroupEntry entry = friendGroupEntries[i];
+                    friendGroupListBox.Items.Add(entry);
+                    if (entry != null && string.Equals(entry.Id, friendEditingGroupId, StringComparison.OrdinalIgnoreCase)) selected = i;
+                }
+                if (selected < 0 && friendGroupListBox.Items.Count > 0) selected = 0;
+                if (selected >= 0) friendGroupListBox.SelectedIndex = selected;
+            }
+            finally { friendGroupListUpdating = false; }
+        }
+
+        private void SaveFriendGroupControlsIntoEntry(FriendGroupEntry entry)
+        {
+            if (entry == null) return;
+            entry.GroupName = Program.RemoveUnsafeIniCharacters(friendGroupNameBox.Text).Trim();
+            if (string.IsNullOrWhiteSpace(entry.GroupName)) entry.GroupName = "Friends";
+            entry.Password = Program.RemoveUnsafeIniCharacters(friendGroupPasswordBox.Text);
+            entry.MySessionName = Program.RemoveUnsafeIniCharacters(friendMySessionNameBox.Text).Trim();
+            entry.FriendNames = NormalizeFriendNames(friendNamesBox.Text);
+            entry.Region = GetSelectedFriendRegion();
+            entry.AutoHost = friendAutoHostBox.Checked;
+            entry.LanOverrides = NormalizeFriendLanOverridesText(friendLanOverridesBox.Text);
+            FriendGroupCollectionCodec.NormalizeEntry(entry);
+        }
+
+        private void LoadFriendGroupEntryIntoControls(FriendGroupEntry entry)
+        {
+            if (entry == null) return;
+            friendEditingGroupId = entry.Id;
+            friendGroupNameBox.Text = entry.GroupName ?? "Friends";
+            friendGroupPasswordBox.Text = entry.Password ?? "";
+            friendMySessionNameBox.Text = entry.MySessionName ?? "";
+            friendNamesBox.Text = entry.FriendNames ?? "";
+            SelectFriendRegion(entry.Region);
+            friendAutoHostBox.Checked = entry.AutoHost;
+            friendLanOverridesBox.Text = entry.LanOverrides ?? "";
+            RefreshFriendLanMemberChoices();
+            RefreshFriendBadgeMemberChoices();
+        }
+
+        private void SwitchFriendGroupEditorSelection()
+        {
+            FriendGroupEntry chosen = friendGroupListBox.SelectedItem as FriendGroupEntry;
+            if (chosen == null || string.Equals(chosen.Id, friendEditingGroupId, StringComparison.OrdinalIgnoreCase)) return;
+            SaveFriendGroupControlsIntoEntry(GetSelectedFriendGroupEntry());
+            friendEditingGroupId = chosen.Id;
+            LoadFriendGroupEntryIntoControls(chosen);
+        }
+
+        private void CreateNewFriendGroupInOptions()
+        {
+            SaveFriendGroupControlsIntoEntry(GetSelectedFriendGroupEntry());
+            string name = FriendGroupCollectionCodec.MakeUniqueName(friendGroupEntries, "New Group");
+            FriendGroupEntry entry = FriendGroupCollectionCodec.CreateBlank(name);
+            friendGroupEntries.Add(entry);
+            friendEditingGroupId = entry.Id;
+            friendGroupEnabledBox.Checked = true;
+            RefreshFriendGroupOptionsSelector();
+            LoadFriendGroupEntryIntoControls(entry);
+            friendGroupNameBox.Focus();
+            friendGroupNameBox.SelectAll();
+        }
+
+        private void DeleteFriendGroupInOptions()
+        {
+            FriendGroupEntry current = GetSelectedFriendGroupEntry();
+            if (current == null) return;
+            if (MessageBox.Show("Delete Friend Group '" + current.GroupName + "' from this PC?\n\nThis does not delete any .dnlgroup file you exported.",
+                "Delete Friend Group", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            int index = friendGroupEntries.IndexOf(current);
+            friendGroupEntries.Remove(current);
+            if (friendGroupEntries.Count == 0)
+            {
+                FriendGroupEntry blank = FriendGroupCollectionCodec.CreateBlank("Friends");
+                friendGroupEntries.Add(blank);
+                friendGroupEnabledBox.Checked = false;
+                index = 0;
+            }
+            if (index >= friendGroupEntries.Count) index = friendGroupEntries.Count - 1;
+            friendEditingGroupId = friendGroupEntries[Math.Max(0, index)].Id;
+            RefreshFriendGroupOptionsSelector();
+            LoadFriendGroupEntryIntoControls(GetSelectedFriendGroupEntry());
+        }
+
+        private void RefreshFriendBadgeMemberChoices()
+        {
+            string previous = friendBadgeMemberBox.SelectedItem != null ? friendBadgeMemberBox.SelectedItem.ToString() : "";
+            List<string> names = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string self = Program.RemoveUnsafeIniCharacters(friendMySessionNameBox.Text).Trim();
+            // Include the local identity in badge customization. The shared
+            // .dnlgroup already carries every member (including self), so allowing a
+            // custom badge here lets one person fully prepare the portable group file.
+            if (self.Length > 0 && seen.Add(self)) names.Add(self);
+
+            string normalized = NormalizeFriendNames(friendNamesBox.Text);
+            foreach (string line in normalized.Split(new string[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = line.Trim();
+                if (name.Length > 0 && seen.Add(name)) names.Add(name);
+            }
+
+            friendBadgeMemberBox.Items.Clear();
+            foreach (string name in names) friendBadgeMemberBox.Items.Add(name);
+            int selected = -1;
+            for (int i = 0; i < friendBadgeMemberBox.Items.Count; i++)
+                if (!string.IsNullOrWhiteSpace(previous) &&
+                    string.Equals(previous, friendBadgeMemberBox.Items[i].ToString(), StringComparison.OrdinalIgnoreCase))
+                { selected = i; break; }
+            if (selected < 0 && friendBadgeMemberBox.Items.Count > 0) selected = 0;
+            if (selected >= 0) friendBadgeMemberBox.SelectedIndex = selected;
+        }
+
+        private void ChooseFriendBadgeImage()
+        {
+            RefreshFriendBadgeMemberChoices();
+            if (friendBadgeMemberBox.SelectedItem == null)
+            {
+                MessageBox.Show("Set My session name or add at least one group member first.", "Friend Badge",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string member = friendBadgeMemberBox.SelectedItem.ToString();
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Choose Friend Badge for " + member;
+                dlg.Filter = "Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif)|*.png;*.jpg;*.jpeg;*.bmp;*.gif|All files (*.*)|*.*";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                string error;
+                if (!FriendBadgeStore.TrySave(member, dlg.FileName, out error))
+                    MessageBox.Show(error, "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                else
+                {
+                    friendShowBadgesBox.Checked = true;
+                    MessageBox.Show("Custom badge saved for " + member + ".", "Friend Badge",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+        }
+
+        private void PasteFriendBadgeImage()
+        {
+            RefreshFriendBadgeMemberChoices();
+            if (friendBadgeMemberBox.SelectedItem == null)
+            {
+                MessageBox.Show("Set My session name or add at least one group member first.", "Friend Badge",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (!Clipboard.ContainsImage())
+            {
+                MessageBox.Show("The clipboard does not currently contain an image.\n\nCopy the profile picture itself, or use Choose image... after saving it.",
+                    "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string member = friendBadgeMemberBox.SelectedItem.ToString();
+            using (Image image = Clipboard.GetImage())
+            {
+                if (image == null)
+                {
+                    MessageBox.Show("Could not read the clipboard image.",
+                        "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                string error;
+                if (!FriendBadgeStore.TrySaveImage(member, image, out error))
+                {
+                    MessageBox.Show(error, "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+            }
+            friendShowBadgesBox.Checked = true;
+            MessageBox.Show("Custom badge pasted for " + member + ". It will be included in future .dnlgroup exports.",
+                "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ClearFriendBadgeImage()
+        {
+            RefreshFriendBadgeMemberChoices();
+            if (friendBadgeMemberBox.SelectedItem == null) return;
+            string member = friendBadgeMemberBox.SelectedItem.ToString();
+            FriendBadgeStore.Delete(member);
+            MessageBox.Show("Custom badge cleared for " + member + ". The generated initials badge will be used instead.",
+                "Friend Badge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void RefreshFriendLanMemberChoices()
+        {
+            string previous = friendLanMemberBox.SelectedItem != null ? friendLanMemberBox.SelectedItem.ToString() : "";
+            List<string> names = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string self = Program.RemoveUnsafeIniCharacters(friendMySessionNameBox.Text).Trim();
+            string normalized = NormalizeFriendNames(friendNamesBox.Text);
+            foreach (string line in normalized.Split(new string[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = line.Trim();
+                if (name.Length > 0 && !string.Equals(name, self, StringComparison.OrdinalIgnoreCase) && seen.Add(name))
+                    names.Add(name);
+            }
+
+            friendLanMemberBox.BeginUpdate();
+            friendLanMemberBox.Items.Clear();
+            foreach (string name in names) friendLanMemberBox.Items.Add(name);
+            friendLanMemberBox.EndUpdate();
+
+            int selected = -1;
+            for (int i = 0; i < friendLanMemberBox.Items.Count; i++)
+                if (!string.IsNullOrWhiteSpace(previous) &&
+                    string.Equals(previous, friendLanMemberBox.Items[i].ToString(), StringComparison.OrdinalIgnoreCase))
+                { selected = i; break; }
+            if (selected < 0 && friendLanMemberBox.Items.Count > 0) selected = 0;
+            if (selected >= 0) friendLanMemberBox.SelectedIndex = selected;
+            else
+            {
+                friendLanAddressBox.Text = "";
+                friendLanPortBox.Value = 2626;
+                friendLanStatusLabel.Text = "Add at least one Friend above before creating a LAN connection override.";
+            }
+            LoadFriendLanEditorSelection();
+        }
+
+        private void LoadFriendLanEditorSelection()
+        {
+            if (friendLanMemberBox.SelectedItem == null) return;
+            string member = friendLanMemberBox.SelectedItem.ToString();
+            FriendLanEndpoint endpoint;
+            if (FriendLanOverrideCodec.TryGet(friendLanOverridesBox.Text, member, out endpoint) && endpoint != null)
+            {
+                friendLanAddressBox.Text = endpoint.Address ?? "";
+                int port = endpoint.Port >= 1 && endpoint.Port <= 65535 ? endpoint.Port : 2626;
+                friendLanPortBox.Value = port;
+                friendLanStatusLabel.Text = member + " will use LAN Direct IP when their Friend lobby is discovered.";
+            }
+            else
+            {
+                friendLanAddressBox.Text = "";
+                friendLanPortBox.Value = 2626;
+                friendLanStatusLabel.Text = member + " uses the normal Friend / Traversal connection.";
+            }
+        }
+
+        private void SaveFriendLanOverrideFromOptions()
+        {
+            if (friendLanMemberBox.SelectedItem == null)
+            {
+                MessageBox.Show("Choose a Friend first.", "LAN Connection", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string member = friendLanMemberBox.SelectedItem.ToString();
+            string address = (friendLanAddressBox.Text ?? "").Trim();
+            int port = (int)friendLanPortBox.Value;
+            if (address.Length == 0)
+            {
+                MessageBox.Show("Enter the host computer's LAN address or IP.", "LAN Connection",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Reuse the same parser as runtime routing so Options cannot save an
+            // endpoint the launcher would later ignore. Bracket literal IPv6 before
+            // appending the separate port field.
+            string endpointAddress = address;
+            IPAddress lanIp;
+            if (IPAddress.TryParse(endpointAddress, out lanIp) && endpointAddress.IndexOf(':') >= 0)
+                endpointAddress = "[" + endpointAddress + "]";
+            Dictionary<string, FriendLanEndpoint> one = FriendLanOverrideCodec.Parse(member + "=" + endpointAddress + ":" + port.ToString());
+            FriendLanEndpoint normalized;
+            if (!one.TryGetValue(member, out normalized) || normalized == null)
+            {
+                MessageBox.Show("That address or port is not valid. Example address: 192.168.1.25 with port 2626.",
+                    "LAN Connection", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            Dictionary<string, FriendLanEndpoint> all = FriendLanOverrideCodec.Parse(friendLanOverridesBox.Text);
+            all[member] = normalized;
+            friendLanOverridesBox.Text = FriendLanOverrideCodec.Serialize(all);
+            friendLanStatusLabel.Text = member + " saved for LAN Direct IP on this PC.";
+        }
+
+        private void ClearFriendLanOverrideFromOptions()
+        {
+            if (friendLanMemberBox.SelectedItem == null) return;
+            string member = friendLanMemberBox.SelectedItem.ToString();
+            Dictionary<string, FriendLanEndpoint> all = FriendLanOverrideCodec.Parse(friendLanOverridesBox.Text);
+            all.Remove(member);
+            friendLanOverridesBox.Text = FriendLanOverrideCodec.Serialize(all);
+            friendLanAddressBox.Text = "";
+            friendLanPortBox.Value = 2626;
+            friendLanStatusLabel.Text = member + " uses the normal Friend / Traversal connection.";
+        }
+
+        private static string NormalizeFriendLanOverridesText(string raw)
+        {
+            return FriendLanOverrideCodec.Normalize(raw);
+        }
+
+        private FriendGroupProfile BuildFriendGroupProfileFromOptions()
+        {
+            SaveFriendGroupControlsIntoEntry(GetSelectedFriendGroupEntry());
+            FriendGroupEntry active = GetSelectedFriendGroupEntry();
+            if (active == null) return null;
+            return FriendGroupProfileFile.Create(
+                active.GroupName, active.Password, active.Region, active.MySessionName, active.FriendNames);
+        }
+
+        private void ExportFriendGroupProfileFromOptions()
+        {
+            FriendGroupProfile profile = BuildFriendGroupProfileFromOptions();
+            if (profile == null || profile.Members.Count == 0 || string.IsNullOrWhiteSpace(profile.Password))
+            {
+                MessageBox.Show(
+                    "Enter a shared password and at least one member session name before exporting a Friend Group profile.",
+                    "Export Friend Group", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (MessageBox.Show(
+                "This file intentionally contains the group's shared NetPlay password so another member can import it.\n\n" +
+                "Anyone with the file can use that password. Custom member badges are also included when present. " +
+                "Share only images you are comfortable redistributing to the group.\n\nContinue?",
+                "Export Friend Group", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            using (SaveFileDialog dlg = new SaveFileDialog())
+            {
+                dlg.Title = "Export Friend Group";
+                dlg.Filter = "Dolphin NetPlay Friend Group (*.dnlgroup)|*.dnlgroup|All files (*.*)|*.*";
+                string safeName = FriendGroupProfileFile.MakeSafeFileName(profile.GroupName);
+                dlg.FileName = string.IsNullOrWhiteSpace(safeName) ? "Friend-Group.dnlgroup" : safeName + ".dnlgroup";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                string error;
+                if (!FriendGroupProfileFile.TrySave(dlg.FileName, profile, out error))
+                    MessageBox.Show(error, "Export Friend Group", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                else
+                    MessageBox.Show("Friend Group profile exported.", "Export Friend Group",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private void ImportFriendGroupProfileIntoOptions()
+        {
+            using (OpenFileDialog dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Import Friend Group";
+                dlg.Filter = "Dolphin NetPlay Friend Group (*.dnlgroup)|*.dnlgroup|All files (*.*)|*.*";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                FriendGroupProfile profile;
+                string error;
+                if (!FriendGroupProfileFile.TryLoad(dlg.FileName, out profile, out error))
+                {
+                    MessageBox.Show(error, "Import Friend Group", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                string current = friendMySessionNameBox.Text.Trim();
+                string self = FriendGroupIdentityForm.ChooseIdentity(this, settings, profile, current);
+                if (string.IsNullOrWhiteSpace(self)) return;
+
+                SaveFriendGroupControlsIntoEntry(GetSelectedFriendGroupEntry());
+                FriendGroupEntry target = null;
+                foreach (FriendGroupEntry existing in friendGroupEntries)
+                {
+                    if (existing != null && string.Equals(existing.GroupName, profile.GroupName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        target = existing;
+                        break;
+                    }
+                }
+                if (target == null)
+                {
+                    target = FriendGroupCollectionCodec.CreateBlank(profile.GroupName);
+                    friendGroupEntries.Add(target);
+                }
+                string keepLan = target.LanOverrides ?? "";
+                target.GroupName = profile.GroupName;
+                target.Password = profile.Password;
+                target.MySessionName = self;
+                target.FriendNames = FriendGroupProfileFile.BuildFriendListExcluding(profile, self);
+                target.Region = profile.Region;
+                target.AutoHost = true;
+                target.LanOverrides = keepLan;
+                FriendGroupCollectionCodec.NormalizeEntry(target);
+                FriendBadgeStore.ImportProfileBadges(profile);
+                friendEditingGroupId = target.Id;
+                friendGroupEnabledBox.Checked = true;
+                RefreshFriendGroupOptionsSelector();
+                LoadFriendGroupEntryIntoControls(target);
+            }
+        }
+
+        private void SelectFriendRegion(string region)
+        {
+            string normalized = Program.NormalizeFriendRegion(region);
+            for (int i = 0; i < friendRegionBox.Items.Count; i++)
+            {
+                if (friendRegionBox.Items[i].ToString().EndsWith("(" + normalized + ")", StringComparison.OrdinalIgnoreCase))
+                {
+                    friendRegionBox.SelectedIndex = i;
+                    return;
+                }
+            }
+            if (friendRegionBox.Items.Count > 3) friendRegionBox.SelectedIndex = 3;
+        }
 
         private void BuildAppearanceTab(TabPage page)
         {
@@ -13701,9 +17940,54 @@ namespace DolphinNetPlayLauncher
             accentHelp.ForeColor = Color.DimGray;
             accent.Controls.Add(accentHelp);
 
+            GroupBox netplayDisplay = new AdventureGroupBox();
+            netplayDisplay.Text = "NetPlay Browser";
+            netplayDisplay.Location = new Point(18, 493);
+            netplayDisplay.Size = new Size(649, 130);
+            page.Controls.Add(netplayDisplay);
+
+            Label netplayDisplayLabel = new AdventureLabel();
+            netplayDisplayLabel.Text = "Game display:";
+            netplayDisplayLabel.Location = new Point(18, 31);
+            netplayDisplayLabel.AutoSize = true;
+            netplayDisplay.Controls.Add(netplayDisplayLabel);
+
+            netPlayGameDisplayBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            netPlayGameDisplayBox.Items.AddRange(new object[] { "Plain text", "Banners" });
+            netPlayGameDisplayBox.Location = new Point(110, 27);
+            netPlayGameDisplayBox.Size = new Size(160, 24);
+            netPlayGameDisplayBox.SelectedItem = string.Equals(settings.NetPlayGameDisplay, "Banners", StringComparison.OrdinalIgnoreCase)
+                ? "Banners" : "Plain text";
+            netplayDisplay.Controls.Add(netPlayGameDisplayBox);
+
+            Button openSessionBanners = new AdventureButton();
+            openSessionBanners.Text = "Open Banner Folder";
+            openSessionBanners.Location = new Point(288, 25);
+            openSessionBanners.Size = new Size(145, 28);
+            openSessionBanners.Click += delegate
+            {
+                try
+                {
+                    Directory.CreateDirectory(SessionBannerCatalog.OverrideDirectory);
+                    string quoted = ((char)34).ToString() + SessionBannerCatalog.OverrideDirectory + ((char)34).ToString();
+                    Process.Start("explorer.exe", quoted);
+                }
+                catch { }
+            };
+            netplayDisplay.Controls.Add(openSessionBanners);
+
+            Label netplayDisplayHelp = new AdventureLabel();
+            netplayDisplayHelp.Text =
+                "Banner mode uses Dolphin's local cached banners when possible. Missing art falls back to text.\n" +
+                "Optional overrides: SessionBanners\\GAMEID.png or a matching game-title PNG.";
+            netplayDisplayHelp.Location = new Point(18, 68);
+            netplayDisplayHelp.Size = new Size(610, 42);
+            netplayDisplayHelp.ForeColor = Color.DimGray;
+            netplayDisplay.Controls.Add(netplayDisplayHelp);
+
             GroupBox sounds = new AdventureGroupBox();
             sounds.Text = "Interface Sounds";
-            sounds.Location = new Point(18, 493);
+            sounds.Location = new Point(18, 638);
             sounds.Size = new Size(649, 184);
             page.Controls.Add(sounds);
 
@@ -13805,7 +18089,7 @@ namespace DolphinNetPlayLauncher
 
             GroupBox animation = new AdventureGroupBox();
             animation.Text = "Controller Cursor Animation";
-            animation.Location = new Point(18, 692);
+            animation.Location = new Point(18, 837);
             animation.Size = new Size(649, 128);
             page.Controls.Add(animation);
 
@@ -14528,6 +18812,9 @@ namespace DolphinNetPlayLauncher
             sb.AppendLine("Highlight animation rate: " + highlightHzBox.Value.ToString("0") + " Hz");
             sb.AppendLine("Interface sounds: " + interfaceSoundsBox.Checked);
             sb.AppendLine("Sound style: " + soundStyleBox.Text);
+            sb.AppendLine("Friend-group discovery: " + friendGroupEnabledBox.Checked);
+            sb.AppendLine("Friend profiles configured: " + CountFriendNames(friendNamesBox.Text).ToString());
+            sb.AppendLine("Friend auto-host defaults: " + friendAutoHostBox.Checked);
             sb.AppendLine("Controller preference: " + (controllerBox.SelectedItem != null ? controllerBox.SelectedItem.ToString() : "Auto"));
             if (controllerManager != null)
                 sb.AppendLine("Controller status: " + controllerManager.StatusText);
@@ -14560,6 +18847,63 @@ namespace DolphinNetPlayLauncher
             return path;
         }
 
+        private static string NormalizeFriendNames(string raw)
+        {
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<string> names = new List<string>();
+            string normalized = (raw ?? "").Replace("\r", "\n");
+            foreach (string part in normalized.Split(new char[] { '\n', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = Program.RemoveUnsafeIniCharacters(part).Trim();
+                if (name.Length == 0 || !seen.Add(name)) continue;
+                names.Add(name);
+            }
+            return string.Join(Environment.NewLine, names.ToArray());
+        }
+
+        private static int CountFriendNames(string raw)
+        {
+            string normalized = NormalizeFriendNames(raw);
+            if (string.IsNullOrWhiteSpace(normalized)) return 0;
+            return normalized.Split(new string[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries).Length;
+        }
+
+        private string GetSelectedFriendRegion()
+        {
+            if (friendRegionBox.SelectedItem == null) return "NA";
+            string item = friendRegionBox.SelectedItem.ToString();
+            int open = item.LastIndexOf('(');
+            int close = item.LastIndexOf(')');
+            string code = open >= 0 && close > open ? item.Substring(open + 1, close - open - 1) : item;
+            return Program.NormalizeFriendRegion(code);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+
+            // Own Options terminal sounds at one form-lifecycle boundary.
+            // Mouse, keyboard and controller activation all eventually close this same
+            // modal, so there is no need for competing Click + generic-input owners.
+            // The guard also protects against any repeated close request during teardown.
+            if (e.Cancel || terminalDialogSoundPlayed)
+                return;
+
+            if (DialogResult == DialogResult.OK)
+            {
+                terminalDialogSoundPlayed = true;
+                // User-validated semantic target: Options OK uses the same affirmative
+                // cue as Use Game, but exactly once at the terminal dialog boundary.
+                UiSoundManager.PlayNamed(settings, "use_game");
+            }
+            else if (DialogResult == DialogResult.Cancel)
+            {
+                terminalDialogSoundPlayed = true;
+                // Options cancellation intentionally uses the error/back-out cue.
+                UiSoundManager.PlayNamed(settings, "error");
+            }
+        }
+
         private void ApplySettings()
         {
             ApplySettingsTo(settings, true);
@@ -14590,6 +18934,8 @@ namespace DolphinNetPlayLauncher
                 UiSoundManager.Configure(target);
             target.LibraryView = libraryViewBox.SelectedItem != null &&
                 libraryViewBox.SelectedItem.ToString() == "List" ? "List" : "Grid";
+            target.NetPlayGameDisplay = netPlayGameDisplayBox.SelectedItem != null &&
+                netPlayGameDisplayBox.SelectedItem.ToString() == "Banners" ? "Banners" : "Plain";
             target.LibraryGridColumns = (int)libraryColumnsOptionBox.Value;
             target.AutoCloseDolphin = autoCloseBox.Checked;
             target.NetPlayCloseGraceMs = (int)(graceBox.Value * 1000M);
@@ -14611,6 +18957,16 @@ namespace DolphinNetPlayLauncher
             target.ControllerPollingMode = GetSelectedControllerPollingMode();
             target.ControllerHighlightMatchMonitor = highlightAutoBox.Checked;
             target.ControllerHighlightHz = (int)highlightHzBox.Value;
+
+            SaveFriendGroupControlsIntoEntry(GetSelectedFriendGroupEntry());
+            target.FriendGroupEnabled = friendGroupEnabledBox.Checked;
+            target.FriendGroupsData = FriendGroupCollectionCodec.Serialize(friendGroupEntries);
+            target.FriendActiveGroupId = friendEditingGroupId;
+            FriendGroupEntry activeFriendGroup = FriendGroupCollectionCodec.FindById(friendGroupEntries, friendEditingGroupId);
+            if (activeFriendGroup != null) FriendGroupCollectionCodec.ApplyEntryToSettings(target, activeFriendGroup);
+            target.FriendShowOffline = false;
+            target.FriendShowBadges = friendShowBadgesBox.Checked;
+
             if (controllerBox.SelectedIndex <= 0)
                 target.ControllerPreference = "Auto";
             else
@@ -15742,7 +20098,13 @@ namespace DolphinNetPlayLauncher
 
         public static void Attach(Form form, SdlControllerManager manager, DnlSettings settings, TabControl tabs)
         {
-            if (form == null || manager == null || settings == null) return;
+            if (form == null || settings == null) return;
+
+            // Mouse interaction uses the same semantic sound vocabulary as controller
+            // input. Mouse handlers are attached even if no controller manager exists.
+            UiSoundManager.AttachMouseInteractionSounds(form, settings);
+
+            if (manager == null) return;
 
             ControllerSelectionCursor selectionCursor = new ControllerSelectionCursor(form, settings);
             LauncherForm focusLauncher = form as LauncherForm;
@@ -15989,6 +20351,15 @@ namespace DolphinNetPlayLauncher
                 embeddedSessionsLauncher.HandleSessionsControllerNavigation(action))
                 return;
 
+            // The main Friends roster is a ListBox, but its controller semantics
+            // are deliberately different from the Games library. Earlier behavior let the generic
+            // ListBox handler below intercept the roster first, so A/B/Left/Right never
+            // reached the Friends-specific navigation and the cursor became trapped.
+            LauncherForm mainLauncher = form as LauncherForm;
+            if (mainLauncher != null && !mainLauncher.IsLibraryVisible &&
+                mainLauncher.HandleMainControllerNavigation(action))
+                return;
+
             ListBox activeList = GetDeepActiveControl(form) as ListBox;
             if (activeList != null)
             {
@@ -16144,11 +20515,6 @@ namespace DolphinNetPlayLauncher
                     return;
                 }
             }
-
-            LauncherForm mainLauncher = form as LauncherForm;
-            if (mainLauncher != null && !mainLauncher.IsLibraryVisible &&
-                mainLauncher.HandleMainControllerNavigation(action))
-                return;
 
             ComboBox activeCombo = GetDeepActiveControl(form) as ComboBox;
             if (activeCombo != null && activeCombo.DroppedDown)

@@ -1,6 +1,7 @@
 DOLPHIN NETPLAY LAUNCHER
 ========================
-Release: 0.11.0
+Current release: 0.12.0 — Friend Groups Update
+Previous release: 0.11.0
 
 Dolphin NetPlay Launcher is a Windows frontend for Dolphin NetPlay. It simplifies Host and Join
 setup while leaving Dolphin itself in charge of emulation, networking, compatibility, and updates.
@@ -10,6 +11,57 @@ reference guide.
 
 Dolphin NetPlay Launcher does not provide Dolphin or game files.
 
+
+WHY MAKE THIS?
+--------------
+I made Dolphin NetPlay Launcher because I wanted an easier way to play Dolphin NetPlay with friends who do
+not use it often enough to remember all of the setup. Instead of walking everyone through the same Dolphin
+menus and connection steps again each time we play, I wanted a simple way to handle the repetitive parts.
+
+It also solves a specific problem when using Steam as a frontend for Dolphin games through Steam ROM Manager.
+Launching an individual Dolphin game from Steam normally starts that game directly. To use NetPlay instead,
+you would otherwise need to open Dolphin separately -- either by adding Dolphin itself to Steam or launching
+Dolphin.exe directly -- then navigate through the NetPlay setup before hosting or joining.
+
+Dolphin NetPlay Launcher bridges that gap. A game selected through Steam can be passed to the launcher first,
+where you can choose Host or Join and let the launcher handle the NetPlay setup in Dolphin. Friend Groups make
+repeat sessions even simpler by letting you find the friend who is hosting and join without exchanging room
+codes or walking everyone through the process again.
+
+The normal Host/Join flow can also be handled entirely with a controller, avoiding the need to switch back to
+mouse and keyboard just to navigate Dolphin's NetPlay setup.
+
+Dolphin NetPlay Launcher is not meant to replace Dolphin or its NetPlay implementation. The goal is to make
+getting into Dolphin NetPlay more convenient.
+
+
+HOW DOES IT WORK?
+-----------------
+Dolphin NetPlay Launcher does not implement NetPlay itself. Dolphin still handles the actual connection,
+emulation, synchronization, game launch, and NetPlay session. The launcher automates the setup needed to
+reach Dolphin's existing NetPlay lobby.
+
+When you choose Host or Join, Dolphin NetPlay Launcher:
+1. Identifies the selected game with DolphinTool.exe when a local game needs to be staged for hosting.
+2. Writes the required NetPlay settings to Dolphin's configuration, including nickname, Traversal/Direct-IP
+   details, and public-session settings. Hosting also stages the selected game for Dolphin's Host page.
+3. Starts Dolphin normally.
+4. Waits for Dolphin's main window, then opens Tools -> Start NetPlay.
+5. Detects Dolphin's NetPlay Setup window and performs the appropriate Host or Connect action.
+6. Waits for Dolphin's real NetPlay lobby. At that point Dolphin has taken over and setup automation is done.
+7. Optionally provides the launcher's controller shortcuts for useful lobby actions and the normal return
+   lifecycle afterward.
+
+WHY UI AUTOMATION?
+Dolphin exposes useful command-line and configuration functionality, but it does not currently expose a
+supported command-line action for opening NetPlay directly into a Host or Join session. Dolphin NetPlay
+Launcher therefore combines Dolphin's normal configuration files with narrowly scoped Windows UI automation
+for the final setup steps. In practical terms, it performs the same Dolphin menu/button actions a person would
+otherwise perform manually. Automation is limited to the Dolphin process launched for that session, validates
+the expected Dolphin windows before acting, and stops driving setup when the actual NetPlay lobby appears.
+
+It is a little unconventional, but without a NetPlay command-line/API entry point in Dolphin there is not
+currently a cleaner supported route to the same seamless workflow. Regardless, it works.
 
 QUICK INSTALL
 -------------
@@ -26,6 +78,94 @@ Requirements:
    add your game folders, then close Dolphin.
 
 The launcher reads the game folders already configured in Dolphin.
+
+
+FRIEND GROUPS / .DNLGROUP QUICK START
+--------------------------------------
+Friend Groups are designed for repeat NetPlay with the same people. They let Dolphin NetPlay Launcher
+recognize configured friends in Dolphin's public NetPlay lobby and prepare the correct Join target without
+passing a new room code around every time.
+
+A Friend Group stores:
+- Group name
+- Region
+- Shared NetPlay password
+- Your session name for that group
+- The other members' session names
+- Per-PC LAN overrides for that active group (local only; not shared)
+
+You can save multiple Friend Groups and switch the active group from the dropdown in either Host or
+Join -> Friends. Both dropdowns select the same single active group. When Join -> Friends is active, or Host
+is using the active Friend Group, Nickname automatically changes to your identity in that group. Switching
+groups updates Nickname to that group's identity. The field remains editable; the automatic match is only a
+convenience.
+
+SHARING A GROUP:
+1. Open Options -> Friends and create/select the group.
+2. Add every member, including yourself as the local identity.
+3. Choose Export active group... to create a .dnlgroup file.
+4. Send that file only to the intended group.
+5. Each person imports it (or drags it onto the main launcher), chooses which member they are, and the group
+   is added to their local group dropdown. Nobody edits themselves in or out of the shared file. If the launcher
+   is running as Administrator, Windows may block drag/drop from normal File Explorer; use Import .dnlgroup...
+   instead.
+6. When a member hosts, choose Join -> Friends, select the correct group, highlight that person, load them,
+   then use Join.
+
+IMPORTANT SECURITY NOTE:
+A .dnlgroup file intentionally contains the shared NetPlay password so it can be used on another computer.
+It may also contain the small custom badge images assigned to group members, including your own identity.
+Set your own badge before export if you want the shared file to arrive with a complete set of profile pictures.
+It is a portable group profile, not encrypted secret storage. Do not post it publicly, and only include images
+you are comfortable sharing.
+
+SAME-NETWORK / LAN FRIENDS:
+If someone in the group is on the same home network and needs Direct IP, configure that Friend under
+Options -> Friends -> Same-network / LAN connection on the joining PC. Discovery still happens through the
+Friend Group. When that Friend is loaded, Route: LAN is the default. If that same person is currently hosting
+from another network, toggle the main Friends route button to Route: Internet for that join instead of deleting
+the saved LAN mapping. LAN mappings are not included in .dnlgroup files. A router port-forward can make
+Traversal happen to work for a same-network host in some environments; current testing showed that behavior
+following whichever household PC received the forward. Do not treat that as a replacement for the explicit
+per-PC LAN Direct-IP override.
+
+Full guides:
+Documentation\Dolphin-NetPlay-Launcher-Friend-Groups-Guide-v1.pdf  (visual walkthrough with screenshots)
+Documentation\FRIEND-GROUPS-AND-DNLGROUP.md  (full text reference)
+
+
+NETPLAY BANNERS
+---------------
+Options -> Appearance -> NetPlay Browser offers:
+- Banners — the default presentation; adds cached Dolphin-style game banners to Public Sessions and Join -> Friends when local artwork is available.
+- Plain text — keeps the compact text-only presentation if you prefer it.
+
+In banner mode:
+- Public Sessions uses a taller four-line banner row so session/game/ID-revision/region/player/state information is easier to read.
+- Friends uses 36 px rows with the Friend badge, two-line Friend/game/state text, and a compact banner.
+- Game ID and Revision are kept as text when Dolphin NetPlay Launcher can parse them from the advertised name.
+- Missing art falls back to text immediately.
+
+Banner source priority:
+1. For normal Dolphin NetPlay names, the advertised Game ID is matched directly against Dolphin's existing gamelist.cache (the Games panel does not need to be opened first).
+2. Launcher title/path metadata is a fallback for nonstandard names.
+3. A manual PNG under SessionBanners, named GAMEID.png or by matching advertised game title.
+4. No banner / normal text fallback.
+
+Use Options -> Appearance -> NetPlay Browser -> Open Banner Folder to create/open the override folder.
+Automatic downloading is intentionally not enabled yet; a future downloader needs a reliable banner source and
+clear naming/redistribution behavior first.
+
+Full guide:
+Documentation\SESSION-BANNERS.md
+
+
+RESPONSIVE MAIN WINDOW
+----------------------
+The main launcher keeps the accepted shallow transparent header and opaque/card-heavy content architecture.
+Vertical resizing is mode-aware: Friends spends extra height on the roster; Host and Traversal/Direct re-center
+their fixed active controls between the upper selectors and Dolphin utilities instead of splitting into one large
+empty central gap. This is layout/geometry only; the rejected transparency/compositing experiments remain retired.
 
 
 FRESH-START FIELD DEFAULTS
@@ -56,8 +196,11 @@ HOST
 ----
 1. Open Games and choose the game you want to host.
 2. Select Host and enter your nickname.
-3. Optional: enable Show in Server Browser and enter the public-session details you want.
-4. Choose Host.
+3. For Friend Group hosting, choose the group from the Host Friend Group dropdown. That becomes the same
+   active group used by Join -> Friends; its saved session name, shared password, and region are applied to
+   the existing public-hosting workflow.
+4. Or configure ordinary Show in Server Browser details manually.
+5. Choose Host.
 
 Hosting uses Dolphin's Traversal Server. Dolphin NetPlay Launcher opens Dolphin's NetPlay
 interface, selects the game, and creates the lobby.
@@ -69,6 +212,7 @@ You do NOT need to select a local game before joining. The host determines the g
 the session.
 
 You can join with:
+- Friends — select the active Friend Group, highlight a hosting friend, load them, then use Join.
 - Sessions — choose a compatible public session, then use it for Join.
 - Traversal — enter or paste the host's room code.
 - Direct IP — enter the host's IP address and port.
@@ -178,11 +322,12 @@ It does not force-kill Dolphin.
 SETTINGS AND DIAGNOSTICS
 ------------------------
 Options include:
+- Friend Groups, .dnlgroup import/export, custom badges, and per-group LAN routing
 - Dolphin selection
 - Automatic close behavior
 - Close grace periods
 - Appearance/themes
-- Interface sounds
+- Interface sounds (mouse and controller actions share semantic cues; bundled Switch/selection feedback uses the softer cue, Refresh uses Navigate; Host PUBLIC HOSTING checkboxes also use Navigate; Options OK uses Use Game and Options Cancel uses Error)
 - Controller settings
 - Games preferences
 - Diagnostics
@@ -206,12 +351,25 @@ Fresh installs and Reset Options use:
 - Animated Gradient accents
 - Animated theme background
 - Classic UI (Lokif CC0) interface sounds
+- Automatic Dolphin close after NetPlay, with a 1.0 second NetPlay-close grace period
+- A 1.0 second updater-close grace period
+- Automatic return to Dolphin NetPlay Launcher after a failed Join
+- Return to Dolphin NetPlay Launcher when Dolphin closes
 
-Existing saved preferences are preserved.
+Existing saved preferences are preserved. Changing a default does not overwrite an already-saved explicit preference.
 
 
 TROUBLESHOOTING
 ---------------
+MY CONTROLLER ISN'T WORKING IN-GAME!
+Dolphin can see controllers differently depending on how it was launched. In particular, a controller exposed
+to Dolphin when it is started through Steam may differ from the controller Dolphin sees when it is launched
+directly. This comes from Dolphin/Steam's controller handling, not Dolphin NetPlay Launcher.
+
+If your controls work when launching Dolphin one way but not another, open Dolphin using the same method you
+normally use for your games and configure the controller there. If you normally launch your Dolphin games
+through Steam, configure Dolphin's controls while using that same Steam launch path.
+
 Dolphin was not found:
 Choose another Dolphin.exe, or use Options -> Change Dolphin. The selected installation must
 contain both Dolphin.exe and DolphinTool.exe.

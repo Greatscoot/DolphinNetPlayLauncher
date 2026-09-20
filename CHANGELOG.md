@@ -1,8 +1,22 @@
 # Changelog
 
-This changelog summarizes user-facing releases and major milestones.
-Internal test builds, release candidates, diagnostic builds, and experimental branches are omitted.
+## 0.12.0 — Friend Groups Update
 
+### Added
+- Friend Groups that use Dolphin's public NetPlay lobby to find configured friends without exchanging room codes every session.
+- Multiple saved Friend Groups with synchronized Host/Join group selection.
+- Portable `.dnlgroup` import/export with identity selection and optional member badges.
+- Local per-PC Same-network / LAN Friend overrides with temporary LAN/Internet route switching.
+- Friend identity → Nickname convenience while keeping Nickname editable.
+- Optional game-banner presentation for Friends and Public Sessions using Dolphin's local cached artwork, with text fallback and manual overrides.
+- Illustrated Friend Groups / `.dnlgroup` setup guide alongside the detailed text guide.
+
+### Improved
+- Responsive Friends/Public Sessions presentation and banner-row layout.
+- Theme switching now preserves the correct Friends row geometry in both Plain and Banners modes.
+- Mouse/controller interface-sound behavior is more consistent across selections, settings, modal openers, and Library game loading.
+- Runtime/theme icon assets are organized under `Assets/Icons`.
+- Fresh/reset defaults favor the new 0.12 presentation while preserving existing saved preferences.
 ## 0.11.0 — 2026-09-18
 
 ### Added

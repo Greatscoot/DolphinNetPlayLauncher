@@ -64,7 +64,7 @@ if not defined CSC (
 )
 
 echo Building Dolphin NetPlay Launcher %APP_VERSION%...
-"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /out:"DolphinNetPlayLauncher.exe" /win32icon:"DolphinNetPlayLauncher.ico" /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll "DolphinNetPlayLauncher.cs"
+"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /out:"DolphinNetPlayLauncher.exe" /win32icon:"Assets\Icons\DolphinNetPlayLauncher.ico" /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.Security.dll "DolphinNetPlayLauncher.cs"
 
 if errorlevel 1 (
   echo.
